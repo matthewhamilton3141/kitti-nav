@@ -37,6 +37,7 @@ ported unchanged, and one of its headline results did not reproduce (below).
 | Learned planner (PPO) behind the shield | done | **78% success, 0 collisions** on real KITTI |
 | Shield-in-the-loop, 5-seed replication | done | **negative result** (see below) |
 | **VO poses + lidar fused into an accumulated map** | **done this session** | **1.86× the scene mapped at 5 scans** |
+| **Planner driving the fused map** | **done this session** | **shield still 0 collisions; success −12 to −14 pts** |
 
 Full numbers: `README.md` and `scripts/RESULTS.md`.
 
@@ -76,6 +77,32 @@ single-scan parity needed a threshold that pushed occupancy *below* the single-s
 i.e. deleting real geometry. And detecting ego returns by sensor-frame persistence needs a
 lateral bound: roadside structure persists too while the car holds its lane, and without it the
 audit returns a kerb line at y ≈ −2.3 m present in 100% of scans.
+
+**The planner now drives the fused map** (`KittiScenes(map_config=MapConfig(window=5))`,
+`eval_policies.py --fused-window`). Default is still a single scan, so every earlier number
+stays reproducible — and the single-scan column re-ran **bit-identically** (66%/68, 78%/42,
+78%/0), which is the check that the ego self-filter really is a no-op on the un-fused path.
+
+| policy | single scan | fused (5 scans) |
+| --- | --- | --- |
+| gap-following | 66% / 68 coll | 59% / 82 |
+| gap-following + shield | 66% / **0** | 54% / **0** |
+| PPO (raw) | 78% / 42 | 66% / 67 |
+| PPO (raw) + shield at eval | 75% / **0** | 62% / **0** |
+| PPO through shield | 78% / **0** | 64% / **0** |
+
+**The headline is the shield column.** Same policy weights, no retraining, no notice that the
+map changed — unshielded collisions rise (42→67) and success falls 12–14 points, while every
+shielded row stays at **exactly 0**. The shield is not a policy; it re-derives a braking
+certificate from whatever occupancy it is handed, so more obstacles make it more conservative,
+never less sound. This is the strongest evidence in the repo that the guarantee is a property
+of the method rather than of the scenes it was tuned against.
+**Do not read the success drop as a regression** — the single-scan map was missing 44% of the
+fused map's occupied cells, so the old numbers were partly measuring the map's blindness.
+Both tables are kept: the single-scan one is what the 5-seed negative result was measured
+against. On fused maps in-loop training leads +2 pts (64 vs 62), same small same-signed gap
+as single-scan (+3) — corroboration, not evidence; the seed sweep has **not** been re-run on
+fused maps (~35 min if wanted).
 
 **Also corrected this session:** the README's ground-removal table did not reproduce
 (claimed 1.82%/6.23% occupancy and `height_diff` as the *faster* mode; actually 2.40%/3.65% at
@@ -184,22 +211,23 @@ Seed spread was small (1.0–2.9 pts), unusually low for deep RL. Sweep cost ~35
 - **VO has no bundle adjustment, keyframing, or loop closure** — error accumulates
   monotonically. 3.55% is respectable, not SOTA.
 - **One drive, one hyperparameter set.**
-- **The planner does not yet drive the fused map.** `mapping.py` produces it and
-  `eval_mapping.py` measures it, but `nav_env.py`'s `KittiScenes` still builds scenes from a
-  single frozen scan. Wiring it through is the obvious next step and would re-open every
-  policy number in `RESULTS.md` — the fused map is harder (more real obstacles), so expect
-  success rates to move.
+- **Policies are still *trained* on synthetic scenes only.** The fused-map column is pure
+  transfer — no policy has ever been trained on an accumulated map. Training on fused KITTI
+  geometry is untried and is the obvious way to recover the 12–14 points.
+- **The seed sweep has not been re-run on fused maps.** The negative result stands on
+  single-scan scenes; the fused table is one seed.
 
 ## What next — options
 
 **My recommendation: (1) then (2).** Option 1 from the previous handoff is done.
 
-1. **Free-space carving, then let the planner drive the fused map.** Ray-cast each scan to
-   mark what it saw *through* as free, so dynamic actors stop smearing into permanent walls
-   and the map gains a real free/unknown/occupied distinction instead of `outside_is_free`.
-   This is the direct unblock for both top gaps above, needs no new dependencies, and the
-   measurement harness already exists — `eval_mapping.py` would show it as the missed/phantom
-   split improving at large windows.
+1. **Free-space carving.** Ray-cast each scan to mark what it saw *through* as free, so
+   dynamic actors stop smearing into permanent walls and the map gains a real
+   free/unknown/occupied distinction instead of `outside_is_free`. Direct unblock for both top
+   gaps above, no new dependencies, and both measurement harnesses already exist:
+   `eval_mapping.py` would show it as the missed/phantom split improving at large windows, and
+   `eval_policies.py --fused-window` would show whether it wins back some of the 12–14 points
+   fusion cost (some of that cost is smeared traffic, i.e. obstacles that are not really there).
 2. **Dynamic obstacles.** Parse KITTI tracklets (or synthesise moving actors) and extend the
    shield to reason about a moving obstacle's reachable set rather than a static one. This is
    where the safety argument gets properly hard — and where "AV" actually lives. Carving (1)

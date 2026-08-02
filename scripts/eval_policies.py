@@ -46,12 +46,23 @@ def load_ppo(path: Path):
 
 
 def scene_sources(args):
+    """Scene sets to score every policy against, in increasing order of realism.
+
+    The two KITTI columns are the same recorded geometry seen two ways: one frozen scan, and
+    a window of scans fused through the drive's poses. The fused map is *harder* rather than
+    better-behaved — it contains obstacles a single scan is simply blind to — so showing both
+    is the honest way to report what connecting odometry to the map costs the planner.
+    """
     sources = {"synthetic": lambda: SyntheticScenes()}
     if not args.no_kitti:
         from kitti_nav.kitti import KittiDrive
+        from kitti_nav.mapping import MapConfig
 
         drive = KittiDrive(args.date, args.drive)
-        sources["KITTI (real)"] = lambda: KittiScenes(drive=drive)
+        sources["KITTI (single scan)"] = lambda: KittiScenes(drive=drive)
+        if args.fused_window > 1:
+            sources[f"KITTI (fused, {args.fused_window} scans)"] = lambda: KittiScenes(
+                drive=drive, map_config=MapConfig(window=args.fused_window))
     return sources
 
 
@@ -63,6 +74,8 @@ def main() -> int:
     p.add_argument("--date", default="2011_09_26")
     p.add_argument("--drive", default="0009")
     p.add_argument("--no-kitti", action="store_true", help="synthetic scenes only")
+    p.add_argument("--fused-window", type=int, default=5,
+                   help="scans fused for the accumulated-map column; 1 disables it")
     args = p.parse_args()
 
     base = DriveNavConfig()

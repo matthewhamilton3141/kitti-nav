@@ -20,6 +20,8 @@ shield-in-the-loop PPO **4.8–5.4 min** (8 parallel envs, CPU).
 
 ## Real KITTI scenes — transfer, never trained on (200 episodes)
 
+One frozen Velodyne scan per scene.
+
 | policy | success | collisions | reward | steps |
 | --- | ---: | ---: | ---: | ---: |
 | gap-following heuristic | 66% | 68 | 26.0 | 27 |
@@ -28,12 +30,41 @@ shield-in-the-loop PPO **4.8–5.4 min** (8 parallel envs, CPU).
 | PPO (raw) + shield at eval | 75% | **0** | 34.5 | 29 |
 | PPO trained *through* the shield | 78% | **0** | 35.4 | 29 |
 
+## Real KITTI scenes, accumulated map — 5 scans fused (200 episodes)
+
+Same drive, same policies, same episodes. The only change is that each scene is built by
+fusing five scans through the drive's poses instead of freezing one, so the planner sees
+geometry a single scan is blind to.
+
+| policy | success | collisions | reward | steps |
+| --- | ---: | ---: | ---: | ---: |
+| gap-following heuristic | 59% | 82 | 21.7 | 28 |
+| gap-following + shield | 54% | **0** | 26.2 | 28 |
+| PPO (raw) | 66% | 67 | 25.7 | 28 |
+| PPO (raw) + shield at eval | 62% | **0** | 29.9 | 29 |
+| PPO trained *through* the shield | 64% | **0** | 30.3 | 29 |
+
 ## What holds
 
 **The shield's guarantee is absolute across every run: 0 collisions, always.** That covers a
 weak heuristic that crashes 151 times unaided, a learned policy that crashes 50 times
 unaided, and (in the unit tests) uniformly random actions. The guarantee does not depend on
 the policy being any good, which is the entire point of a runtime shield.
+
+**It also held when the map got harder underneath it, with no retraining and no notice.**
+The accumulated-map table is the same policy weights meeting denser geometry: unshielded
+collisions rise (42 → 67 for raw PPO, 68 → 82 for the heuristic) and success falls 12–14
+points, while every shielded row stays at exactly 0. The shield is not a policy — it
+re-derives a braking certificate from whatever occupancy it is handed, so extra obstacles
+make it more conservative rather than less sound. This is the strongest evidence here that
+the guarantee is a property of the method rather than of the scenes it was tuned on.
+
+**The success drop on the fused map is not a regression.** The single-scan map is missing
+44% of the occupied cells the five-scan map contains, and permits 16.38 m/s where the fused
+map permits 13.36 (`scripts/eval_mapping.py`). The old numbers were partly measuring the
+map's blindness. The fused numbers are the honest ones for a planner that has seen the
+street; the single-scan table is kept because it is what every earlier result was measured
+against, including the 5-seed negative result below.
 
 **Learning clearly beats the heuristic.** 24% → 66% success on synthetic scenes, 66% → 78%
 on KITTI.
@@ -93,6 +124,12 @@ helps, but that its large win there does not reproduce here.**
 norm where seed variance routinely swamps algorithmic differences (Henderson et al. 2018).
 That makes this comparison better powered than the seed count alone suggests, and it is why
 5 seeds were enough to bound the effect usefully.
+
+**The fused map does not overturn it either.** On the accumulated-map table, in-loop training
+leads by +2 points (64% vs 62%) — the same small, same-signed gap as on single scans (+3),
+comfortably inside the interval above. That is one seed on one scene set, so it is
+corroboration rather than evidence; the seed sweep has not been re-run on fused maps. Worth
+doing, and cheap (~35 min), if the question is ever revisited.
 
 ### Why the difference from gsplat-rt
 

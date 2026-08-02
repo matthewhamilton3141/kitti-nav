@@ -224,3 +224,55 @@ def test_odometry_tracks_a_real_sequence_without_falling_back(drive):
     err = evaluate_trajectory(odo.positions, drive.gt_poses[:, :3, 3])
     assert err.drift_percent < 10.0, f"drift regressed badly: {err}"
     assert err.path_length > 20.0        # the clip really does contain motion
+
+
+# --- the planner driving an accumulated map --------------------------------------------------
+
+def test_kitti_scenes_defaults_to_a_single_scan(drive):
+    """The default must stay the frozen-scan behaviour, or every published policy number
+    silently changes meaning."""
+    from kitti_nav.mapping import drop_ego_returns
+    from kitti_nav.nav_env import KittiScenes
+
+    scenes = KittiScenes(drive=drive, frames=np.array([20]))
+    grid = scenes.sample(np.random.default_rng(0)).grid
+    expected = BEVGrid.from_scan(drop_ego_returns(drive.velodyne(20)))
+    assert np.array_equal(grid.occupancy, expected.occupancy)
+
+
+def test_kitti_scenes_can_serve_an_accumulated_map(drive):
+    """Opting in to fusion gives the planner a materially denser scene of the same street."""
+    from kitti_nav.mapping import MapConfig
+    from kitti_nav.nav_env import KittiScenes
+
+    single = KittiScenes(drive=drive, frames=np.array([20]))
+    fused = KittiScenes(drive=drive, frames=np.array([20]),
+                        map_config=MapConfig(window=5))
+
+    n_single = single.sample(np.random.default_rng(0)).grid.occupancy.sum()
+    n_fused = fused.sample(np.random.default_rng(0)).grid.occupancy.sum()
+    assert n_fused > 1.4 * n_single, f"fusion added little: {n_single} -> {n_fused}"
+
+
+def test_the_shield_still_admits_no_collision_on_a_fused_map(drive):
+    """The guarantee is geometry-agnostic, and a harder map is exactly where that matters.
+
+    The fused map holds obstacles a single scan cannot see, so policies meet genuinely
+    unfamiliar geometry here. The shield is not a policy and does not care: it re-derives a
+    braking certificate from whatever occupancy it is handed.
+    """
+    from kitti_nav.mapping import MapConfig
+    from kitti_nav.nav_env import (
+        DriveNavConfig,
+        DriveNavEnv,
+        KittiScenes,
+        evaluate,
+        gap_following_policy,
+    )
+
+    cfg = DriveNavConfig(use_shield=True)
+    env = DriveNavEnv(KittiScenes(drive=drive, map_config=MapConfig(window=5)), cfg)
+    stats = evaluate(env, lambda o: gap_following_policy(o, cfg), n_episodes=25)
+
+    assert stats["collisions"] == 0
+    assert stats["success_rate"] > 0.2, "the fused scenes should still be solvable"

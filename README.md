@@ -23,6 +23,7 @@ Runs entirely on a laptop — pure NumPy + OpenCV, no GPU, no simulator install.
 | Shield running natively on real lidar | done — **6 ms/frame end to end** |
 | Learned planner behind the shield | done — **78% success, 0 collisions on real KITTI** |
 | VO poses + lidar fused into an accumulated map | done — **1.9× the scene mapped at 5 scans** |
+| Planner driving the accumulated map | done — **still 0 collisions shielded, on harder geometry** |
 
 **105 tests pass.** Dataset-backed tests skip cleanly when KITTI isn't downloaded; the
 environment core is pure NumPy and tests without any RL stack installed.
@@ -326,20 +327,32 @@ policies were trained for 600k steps on **synthetic obstacle fields only**, so t
 numbers are a transfer test onto real recorded street geometry. Training is fast enough to
 be uninteresting: 1.5 min raw, 5.2 min through the shield, on CPU.
 
-**Real KITTI scenes, 200 episodes** (full tables incl. synthetic: [`scripts/RESULTS.md`](scripts/RESULTS.md)):
+**Real KITTI scenes, 200 episodes** (full tables incl. synthetic: [`scripts/RESULTS.md`](scripts/RESULTS.md)).
+The same recorded street, seen two ways — one frozen scan, and five scans fused through the
+drive's poses:
 
-| policy | success | collisions |
-| --- | ---: | ---: |
-| gap-following heuristic | 66% | 68 |
-| gap-following + shield | 66% | **0** |
-| PPO (raw) | 78% | 42 |
-| PPO (raw) + shield at eval | 75% | **0** |
-| PPO trained *through* the shield | 78% | **0** |
+| policy | single scan | | fused map (5 scans) | |
+| --- | ---: | ---: | ---: | ---: |
+| | success | collisions | success | collisions |
+| gap-following heuristic | 66% | 68 | 59% | 82 |
+| gap-following + shield | 66% | **0** | 54% | **0** |
+| PPO (raw) | 78% | 42 | 66% | 67 |
+| PPO (raw) + shield at eval | 75% | **0** | 62% | **0** |
+| PPO trained *through* the shield | 78% | **0** | 64% | **0** |
 
 **The shield's guarantee held in every run: 0 collisions, always** — over a heuristic that
 crashes 68 times unaided, a learned policy that crashes 42 times unaided, and (in tests)
 uniformly random actions. It does not depend on the policy being any good, which is the
 whole point of a runtime shield.
+
+**And it held on the harder map without being told anything had changed.** The fused column
+is the same policies, untouched, meeting geometry a single scan is blind to: unshielded
+collisions rise (42 → 67 for PPO) and success falls 12–14 points, while every shielded row
+stays at exactly 0. The shield is not a policy — it re-derives a braking certificate from
+whatever occupancy it is handed, so more obstacles make it more conservative rather than
+less sound. The success drop is the cost of that conservatism against real obstacles the
+planner previously could not see, and is not a regression: the single-scan map was permitting
+16.38 m/s while missing 44% of the occupied cells the fused map contains.
 
 Shielding a learned policy turns out to be nearly free, and on synthetic scenes it *improves*
 success (66% → 70%). That reads oddly until you notice a collision ends the episode as a

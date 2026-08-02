@@ -27,7 +27,8 @@ from typing import Callable, Optional, Protocol
 
 import numpy as np
 
-from .bev import BEVConfig, BEVGrid
+from .bev import BEVConfig, BEVGrid, occupancy_from_scan
+from .mapping import MapConfig, drop_ego_returns, fuse_scans, window_indices
 from .vehicle import (
     ShieldResult,
     VehicleConfig,
@@ -282,9 +283,22 @@ class SyntheticScenes:
 class KittiScenes:
     """Real recorded street geometry: BEV grids built from a drive's Velodyne scans.
 
-    The scan is frozen as a static obstacle field and the car is asked to cross it. The
-    geometry is genuinely real — parked cars, kerbs, buildings — which is what makes this a
-    transfer test rather than more of the same synthetic distribution.
+    The geometry is frozen as a static obstacle field and the car is asked to cross it. It is
+    genuinely real — parked cars, kerbs, buildings — which is what makes this a transfer test
+    rather than more of the same synthetic distribution.
+
+    **Single scan or accumulated map.** With `map_config` set, the scene is built by fusing a
+    window of scans through estimated poses (`mapping.py`) instead of freezing one. This is
+    not a free upgrade and should not be treated as one: the fused map contains obstacles a
+    single scan could not see — `scripts/eval_mapping.py` measures the single-scan map as
+    missing **44%** of the occupied cells a five-scan map holds — so scenes get genuinely
+    harder, and policy success rates move. It defaults to `None` (single scan) so the
+    existing results stay reproducible, and the comparison is the point.
+
+    `poses` defaults to the drive's OXTS ground truth. Passing this repo's stereo-VO
+    trajectory instead is the more deployable choice and measures the same: at a five-scan
+    window the two agree to 0.01 m/s of shield-permitted speed, because fusion is governed by
+    the *relative* pose error over the window (24 cm) rather than by global drift (12 m).
     """
 
     drive: object                              # KittiDrive; untyped to avoid a hard import
@@ -295,10 +309,39 @@ class KittiScenes:
     frames: Optional[np.ndarray] = None        # restrict to these frames (e.g. a held-out split)
     vehicle: VehicleConfig = field(default_factory=VehicleConfig)
 
+    # None = one frozen scan (the original behaviour). Set it to accumulate a window.
+    map_config: Optional[MapConfig] = None
+    poses: Optional[np.ndarray] = None         # camera-to-world; defaults to OXTS ground truth
+
+    # Grids are cached by frame, which matters more than it looks: every episode resamples a
+    # frame, and building a grid means loading scans *and* computing the distance transform
+    # the shield queries. Without this a training run rebuilds the same few grids thousands
+    # of times. Bounded so a long `frames` pool cannot exhaust memory.
+    grid_cache_size: int = 64
+
+    def __post_init__(self) -> None:
+        from functools import lru_cache
+
+        self._grid = lru_cache(maxsize=self.grid_cache_size)(self._build_grid)
+
+    def _build_grid(self, i: int) -> BEVGrid:
+        """The obstacle field at frame `i`, fused or single-scan."""
+        if self.map_config is None:
+            # Self-filtering even here: it costs zero occupancy cells on a single scan (the
+            # bodywork was already its own ground) and keeps both paths preprocessed alike.
+            return BEVGrid(occupancy_from_scan(
+                drop_ego_returns(self.drive.velodyne(i)), self.bev), self.bev)
+
+        poses = self.drive.gt_poses if self.poses is None else self.poses
+        idx = window_indices(i, self.map_config, self.drive.n_velodyne)
+        pts = fuse_scans([self.drive.velodyne(j) for j in idx],
+                         [poses[j] for j in idx], self.drive.T_cam2_velo)
+        return BEVGrid(occupancy_from_scan(pts, self.bev), self.bev)
+
     def sample(self, rng: np.random.Generator) -> Scene:
         pool = self.frames if self.frames is not None else np.arange(self.drive.n_velodyne)
         i = int(rng.choice(pool))
-        grid = BEVGrid.from_scan(self.drive.velodyne(i), self.bev)
+        grid = self._grid(i)
 
         start = self.drive.vehicle_state_in_lidar(speed=float(rng.uniform(*self.start_speed)))
         goal = np.array([start.x + float(rng.uniform(*self.goal_distance)),
