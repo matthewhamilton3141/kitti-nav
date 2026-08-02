@@ -14,6 +14,7 @@ from kitti_nav.vehicle import (
     can_stop_safely,
     clearance,
     footprint_discs,
+    max_safe_speed,
     safety_shield,
     shielded_rollout,
     step_state,
@@ -242,6 +243,57 @@ def test_shield_falls_back_to_the_held_steer_rather_than_obeying_a_fatal_one(cfg
     assert res.steer == pytest.approx(state.steer), "shield obeyed an uncertifiable steer"
     assert not res.ics
     assert can_stop_safely(step_state(state, res.accel, res.steer, cfg), obstacles, cfg)
+
+
+def test_max_safe_speed_is_unbounded_on_an_open_road(cfg):
+    assert max_safe_speed(np.zeros((0, 3)), cfg) == pytest.approx(cfg.max_speed)
+
+
+def test_max_safe_speed_shrinks_as_an_obstacle_closes_in(cfg):
+    far = max_safe_speed(wall(60.0, cfg), cfg)
+    near = max_safe_speed(wall(25.0, cfg), cfg)
+    closer = max_safe_speed(wall(12.0, cfg), cfg)
+    assert far > near > closer >= 0.0
+
+
+def test_max_safe_speed_agrees_with_the_stopping_distance_formula(cfg):
+    """The bisection must land where v^2/2a says it should, given the footprint and margin.
+
+    The braking room is measured from the *disc cover's* forward reach, not the front
+    bumper: circumscribed discs also bulge past the ends of the rectangle (~0.55 m here), so
+    the shield conservatively treats the car as slightly longer than it is. The barrier is
+    placed close enough that geometry, not `max_speed`, is what binds.
+    """
+    barrier = 25.0
+    centres, radius = footprint_discs(VehicleState(), cfg)
+    reach = float(centres[:, 0].max() + radius)
+    room = barrier - 1.0 - reach - cfg.safety_margin        # wall circles have radius 1
+    expected = np.sqrt(2 * cfg.max_decel * room)
+    assert expected < cfg.max_speed, "test scene must be geometry-limited, not speed-capped"
+    assert max_safe_speed(wall(barrier, cfg), cfg) == pytest.approx(expected, rel=0.05)
+
+
+def test_max_safe_speed_is_zero_when_already_touching(cfg):
+    assert max_safe_speed(wall(cfg.front_overhang + 0.5, cfg), cfg) == 0.0
+
+
+def test_speeds_below_the_max_safe_speed_are_certifiable(cfg):
+    """The bisection's contract: it really is the boundary of `can_stop_safely`."""
+    obstacles = wall(30.0, cfg)
+    v = max_safe_speed(obstacles, cfg)
+    assert can_stop_safely(VehicleState(v=v * 0.95), obstacles, cfg)
+    assert not can_stop_safely(VehicleState(v=v + 1.0), obstacles, cfg)
+
+
+def test_more_footprint_discs_approximate_the_body_more_tightly(cfg):
+    """Adding discs must shrink the conservative excess, never flip to optimistic."""
+    from dataclasses import replace
+
+    excess = []
+    for n in (3, 5, 9):
+        _, radius = footprint_discs(VehicleState(), replace(cfg, n_footprint_discs=n))
+        excess.append(radius - cfg.width / 2)
+    assert excess[0] > excess[1] > excess[2] > 0.0
 
 
 def test_shielded_rollouts_never_collide_across_random_scenes(cfg):

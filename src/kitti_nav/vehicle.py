@@ -44,10 +44,50 @@ Obstacles are `(N, 3)` circles `(cx, cy, r)`.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from typing import Optional
+from dataclasses import dataclass
+from typing import Optional, Protocol, Union
 
 import numpy as np
+
+
+class ObstacleField(Protocol):
+    """Anything that can answer "how far is the nearest obstacle from these points?".
+
+    The seam that lets the shield run unchanged against either hand-made circular obstacles
+    or a real lidar BEV occupancy grid (`bev.BEVGrid`). The shield only ever needs distances,
+    never the obstacle representation itself — so no conversion between the two is required,
+    and in particular occupancy never has to be approximated by circles.
+    """
+
+    def distance_to_obstacles(self, points: np.ndarray) -> np.ndarray:
+        """Distance (m) from each `(n, 2)` query point to the nearest obstacle surface."""
+        ...
+
+
+class CircleField:
+    """Obstacle field backed by an `(N, 3)` array of circles `(cx, cy, r)`."""
+
+    def __init__(self, circles: Optional[np.ndarray]):
+        arr = np.zeros((0, 3), float) if circles is None else \
+            np.asarray(circles, float).reshape(-1, 3)
+        self.circles = arr
+
+    def distance_to_obstacles(self, points: np.ndarray) -> np.ndarray:
+        p = np.asarray(points, float).reshape(-1, 2)
+        if self.circles.size == 0:
+            return np.full(len(p), np.inf)
+        d = np.linalg.norm(p[:, None, :] - self.circles[None, :, :2], axis=2)
+        return np.min(d - self.circles[None, :, 2], axis=1)
+
+
+Obstacles = Union[np.ndarray, ObstacleField, None]
+
+
+def as_field(obstacles: Obstacles) -> ObstacleField:
+    """Coerce circles-or-field into a field. Pass-through if it already is one."""
+    if hasattr(obstacles, "distance_to_obstacles"):
+        return obstacles                                  # already an ObstacleField
+    return CircleField(obstacles)
 
 
 @dataclass(frozen=True)
@@ -63,7 +103,12 @@ class VehicleConfig:
     length: float = 4.77           # bumper to bumper
     width: float = 1.82
     rear_overhang: float = 0.97    # rear axle back to the rear bumper
-    n_footprint_discs: int = 3     # rectangle approximated by this many covering discs
+    # The body rectangle is approximated by this many covering discs. The cover is always
+    # conservative, but its lateral excess over the true half-width shrinks as discs are
+    # added: 3 discs inflate the car by 0.30 m per side, 5 by 0.12 m, 7 by 0.06 m. At 3 the
+    # inflation was large enough to report contact with real KITTI roadside geometry the car
+    # actually cleared, so 5 is the default; cost is linear in this number.
+    n_footprint_discs: int = 5
 
     # --- integration ---
     dt: float = 0.1
@@ -177,31 +222,30 @@ def footprint_discs(state: VehicleState, cfg: VehicleConfig) -> tuple[np.ndarray
     return centres, radius
 
 
-def clearance(state: VehicleState, obstacles: np.ndarray, cfg: VehicleConfig) -> float:
+def clearance(state: VehicleState, obstacles: Obstacles, cfg: VehicleConfig) -> float:
     """Signed distance (m) from the vehicle footprint to the nearest obstacle.
 
     Positive is free space, 0 is touching, negative is overlap. Pure geometry with no env
     state, so the simulator and the shield share one definition of "how close are we."
-    Returns `inf` on an empty obstacle set.
+    Accepts either an `(N, 3)` circle array or any `ObstacleField` (e.g. a lidar BEV grid);
+    returns `inf` when there are no obstacles.
     """
-    obs = np.asarray(obstacles, float).reshape(-1, 3)
-    if obs.size == 0:
-        return float("inf")
+    field = as_field(obstacles)
     centres, radius = footprint_discs(state, cfg)
-    d = np.linalg.norm(centres[:, None, :] - obs[None, :, :2], axis=2)  # (n_discs, n_obs)
-    return float(np.min(d - obs[None, :, 2] - radius))
+    return float(np.min(field.distance_to_obstacles(centres)) - radius)
 
 
-def can_stop_safely(state: VehicleState, obstacles: np.ndarray, cfg: VehicleConfig) -> bool:
+def can_stop_safely(state: VehicleState, obstacles: Obstacles, cfg: VehicleConfig) -> bool:
     """Does a full-braking rollout from `state`, holding the current steer, stay clear?
 
     This is the inductive invariant the shield maintains. Holding steer (rather than
     assuming the wheel straightens) is the conservative reading: it certifies a stop the
     car can execute with no further steering input.
     """
+    field = as_field(obstacles)              # coerce once; this loop runs thousands of times
     s = state
     for _ in range(cfg.max_brake_steps):
-        if clearance(s, obstacles, cfg) < cfg.safety_margin:
+        if clearance(s, field, cfg) < cfg.safety_margin:
             return False
         if s.v <= 1e-9:
             return True                      # at rest and clear: the state is safe forever
@@ -224,7 +268,7 @@ class ShieldResult:
 
 
 def safety_shield(accel_cmd: float, steer_cmd: float, state: VehicleState,
-                  obstacles: np.ndarray, cfg: VehicleConfig) -> ShieldResult:
+                  obstacles: Obstacles, cfg: VehicleConfig) -> ShieldResult:
     """Hard braking-aware safety filter over a commanded `(accel, steer)`.
 
     Searches acceleration from the commanded value down to full braking and returns the
@@ -246,6 +290,7 @@ def safety_shield(accel_cmd: float, steer_cmd: float, state: VehicleState,
     maximum braking as the best available action and flags `ics=True` rather than
     pretending the situation is safe.
     """
+    field = as_field(obstacles)              # coerce once, then reuse across every candidate
     hi = float(np.clip(accel_cmd, -cfg.max_decel, cfg.max_accel))
     lo = -cfg.max_decel
     accels = np.linspace(hi, lo, max(int(cfg.n_accel_candidates), 2))
@@ -259,8 +304,8 @@ def safety_shield(accel_cmd: float, steer_cmd: float, state: VehicleState,
     for steer in steer_options:
         for a in accels:
             nxt = step_state(state, float(a), float(steer), cfg)
-            if clearance(nxt, obstacles, cfg) >= cfg.safety_margin and \
-                    can_stop_safely(nxt, obstacles, cfg):
+            if clearance(nxt, field, cfg) >= cfg.safety_margin and \
+                    can_stop_safely(nxt, field, cfg):
                 intervened = not (np.isclose(a, hi) and np.isclose(steer, steer_cmd))
                 return ShieldResult(accel=float(a), steer=float(steer),
                                     intervened=bool(intervened), ics=False)
@@ -268,7 +313,37 @@ def safety_shield(accel_cmd: float, steer_cmd: float, state: VehicleState,
     return ShieldResult(accel=lo, steer=state.steer, intervened=True, ics=True)
 
 
-def shielded_rollout(policy, state: VehicleState, obstacles: np.ndarray,
+def max_safe_speed(obstacles: Obstacles, cfg: VehicleConfig,
+                   state: Optional[VehicleState] = None, tol: float = 0.05) -> float:
+    """Highest speed from which the shield could still certify a stop at `state`'s pose.
+
+    Bisected rather than solved, because `can_stop_safely` integrates a braking rollout
+    against arbitrary obstacle geometry and has no closed form. Bisection is valid because
+    the predicate is **monotone in speed**: a faster car travels strictly further along the
+    same braking path, so if it cannot stop at `v` it cannot stop at anything above `v`.
+
+    This is the shield's opinion expressed as a speed limit, which makes it directly
+    comparable to what a human driver actually did on the same road.
+    """
+    field = as_field(obstacles)
+    base = state or VehicleState()
+
+    def ok(v: float) -> bool:
+        return can_stop_safely(VehicleState(base.x, base.y, base.yaw, v, base.steer),
+                               field, cfg)
+
+    if not ok(0.0):
+        return 0.0                       # already too close to stop clear even at rest
+    lo, hi = 0.0, cfg.max_speed
+    if ok(hi):
+        return hi
+    while hi - lo > tol:
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if ok(mid) else (lo, mid)
+    return lo
+
+
+def shielded_rollout(policy, state: VehicleState, obstacles: Obstacles,
                      cfg: VehicleConfig, n_steps: int,
                      shield: bool = True) -> tuple[list[VehicleState], dict]:
     """Roll `policy` forward for `n_steps`, optionally through the shield; returns states + stats.
@@ -277,6 +352,7 @@ def shielded_rollout(policy, state: VehicleState, obstacles: np.ndarray,
     control condition that shows the shield is doing something, and the harness the
     braking-vs-one-step comparison in the tests runs through.
     """
+    field = as_field(obstacles)
     states = [state]
     n_intervened = n_ics = 0
     collided = False
@@ -284,13 +360,13 @@ def shielded_rollout(policy, state: VehicleState, obstacles: np.ndarray,
     for _ in range(n_steps):
         accel, steer = policy(state)
         if shield:
-            res = safety_shield(float(accel), float(steer), state, obstacles, cfg)
+            res = safety_shield(float(accel), float(steer), state, field, cfg)
             accel, steer = res.accel, res.steer
             n_intervened += int(res.intervened)
             n_ics += int(res.ics)
         state = step_state(state, float(accel), float(steer), cfg)
         states.append(state)
-        if clearance(state, obstacles, cfg) < 0.0:
+        if clearance(state, field, cfg) < 0.0:
             collided = True
             break
 

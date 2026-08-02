@@ -76,6 +76,15 @@ class KittiDrive:
     def __len__(self) -> int:
         return self._n
 
+    @property
+    def n_velodyne(self) -> int:
+        """Number of Velodyne scans, which is **not always** `len(self)`.
+
+        Real drives drop lidar frames: drive 0009 ships 447 images and OXTS packets but only
+        443 scans. Anything iterating lidar must bound on this, not on the frame count.
+        """
+        return len(self._data.velo_files)
+
     # -- calibration ---------------------------------------------------------------------
 
     @cached_property
@@ -110,13 +119,42 @@ class KittiDrive:
         return np.asarray(self._data.get_rgb(i)[0])
 
     def velodyne(self, i: int) -> np.ndarray:
-        """Raw Velodyne scan as `(N, 4)` — x, y, z, reflectance — in the lidar frame."""
+        """Raw Velodyne scan as `(N, 4)` — x, y, z, reflectance — in the lidar frame.
+
+        Raises with a useful message past the last scan, rather than letting pykitti's
+        internal file list raise a bare `IndexError` from inside a loop (see `n_velodyne`).
+        """
+        if not 0 <= i < self.n_velodyne:
+            raise IndexError(
+                f"velodyne frame {i} out of range: this drive has {self.n_velodyne} scans "
+                f"for {len(self)} image frames (KITTI drives drop lidar frames)")
         return self._data.get_velo(i)
 
     @cached_property
     def T_cam2_velo(self) -> np.ndarray:
         """Lidar -> camera-2 transform, for projecting scans into the camera/BEV frame."""
         return np.asarray(self._data.calib.T_cam2_velo, dtype=np.float64)
+
+    @cached_property
+    def rear_axle_in_lidar(self) -> np.ndarray:
+        """`(x, y)` of the vehicle's rear axle in the Velodyne frame — where to put the car.
+
+        The BEV grid is built in the lidar frame, but the bicycle model's pose is the **rear
+        axle**, and the Velodyne is roof-mounted about 0.81 m ahead of it and 0.31 m to one
+        side. Placing the vehicle footprint at the lidar origin therefore pushes a 4.77 m
+        car most of a metre too far forward, which quietly corrupts every clearance query.
+
+        Taken from `T_velo_imu`'s translation: KITTI's sensor-setup diagram puts the OXTS
+        IMU/GPS unit at the rear axle, so the IMU origin is the vehicle reference point.
+        """
+        return np.asarray(self._data.calib.T_velo_imu, dtype=np.float64)[:2, 3]
+
+    def vehicle_state_in_lidar(self, speed: float = 0.0, steer: float = 0.0):
+        """A `VehicleState` correctly placed in this drive's BEV/lidar frame."""
+        from .vehicle import VehicleState
+
+        x, y = self.rear_axle_in_lidar
+        return VehicleState(x=float(x), y=float(y), yaw=0.0, v=float(speed), steer=steer)
 
     # -- ground truth --------------------------------------------------------------------
 

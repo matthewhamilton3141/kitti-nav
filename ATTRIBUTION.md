@@ -36,12 +36,19 @@ source also carries a provenance header in the file that uses it.
 ## Prior work by this author
 
 ### gsplat-rt
-- **Source:** this author's real-time Gaussian-splat SLAM repo (`~/Documents/gsplat-rt`).
-- **Reused here:** the *design* of the one-step-lookahead safety shield
-  (`src/isaac/nav_sim.py` — `predict_pose` / `clearance_at` / `safety_shield`) and the
-  pure-NumPy, laptop-testable env contract. The kinematics are re-derived for an
-  Ackermann/bicycle vehicle rather than ported verbatim; files that descend from
-  gsplat-rt say so in their module docstring.
+- **Source:** <https://github.com/matthewhamilton3141/gsplat-rt> — this author's real-time
+  TensorRT Gaussian-splat SLAM project.
+- **Reused here:** the *design* of the safety shield (`src/isaac/nav_sim.py` —
+  `predict_pose` / `clearance_at` / `safety_shield`), the ORB + PnP odometry geometry
+  (`src/slam/rgbd_odometry.py`), the pluggable front-end seam, and the pure-NumPy,
+  laptop-testable core contract.
+- **What changed:** the shield's kinematics *and its safety argument* are re-derived for an
+  Ackermann vehicle — a one-step lookahead is unsound at driving speeds, so the braking-
+  rollout formulation replaces it. Stereo depth removes the monocular scale-recovery stage
+  entirely. Circular obstacles are generalised to an `ObstacleField` so real occupancy
+  grids work natively.
+- Files descending from gsplat-rt state so in their module docstring, along with what
+  differs and why. The README has a fuller account.
 
 ## Concepts referenced (not code)
 

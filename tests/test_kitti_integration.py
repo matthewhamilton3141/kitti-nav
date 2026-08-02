@@ -10,9 +10,18 @@ guards against something breaking, not performance claims.
 import numpy as np
 import pytest
 
+from kitti_nav.bev import BEVConfig, BEVGrid
 from kitti_nav.kitti import DEFAULT_DATA_DIR, KittiDrive
 from kitti_nav.odometry import StereoOdometry, evaluate_trajectory
 from kitti_nav.stereo import StereoDepth
+from kitti_nav.vehicle import (
+    VehicleConfig,
+    VehicleState,
+    clearance,
+    max_safe_speed,
+    safety_shield,
+    stopping_distance,
+)
 
 pytestmark = pytest.mark.skipif(
     not (DEFAULT_DATA_DIR / "2011_09_26" / "2011_09_26_drive_0009_sync").exists(),
@@ -96,6 +105,107 @@ def test_velodyne_scan_loads_with_reflectance(drive):
     assert scan.ndim == 2 and scan.shape[1] == 4
     assert scan.shape[0] > 10_000
     assert np.all((scan[:, 3] >= 0.0) & (scan[:, 3] <= 1.0))   # reflectance is normalised
+
+
+# --- BEV occupancy from real lidar ----------------------------------------------------------
+
+def test_real_scans_produce_a_sparse_but_non_empty_grid(drive):
+    """Occupancy on a city street should be a few percent — neither empty nor a solid block.
+
+    An all-zero grid means ground removal ate the obstacles; a mostly-full grid means the
+    road leaked in. Both have happened during development, hence the two-sided bound.
+    """
+    cfg = BEVConfig()
+    for i in (0, 10, 20):
+        grid = BEVGrid.from_scan(drive.velodyne(i), cfg)
+        assert 0.002 < grid.occupied_fraction < 0.20, \
+            f"frame {i}: {grid.occupied_fraction:.3%} occupied"
+
+
+def test_per_cell_ground_beats_a_fixed_plane_on_real_road(drive):
+    """The measured justification for the default `ground_mode`.
+
+    On real scans the fixed-plane band marks substantially more of the grid occupied, and
+    the extra cells are road surface drifting out of the band with slope and sensor pitch —
+    phantom obstacles that would make the shield brake for open road.
+    """
+    scan = drive.velodyne(0)
+    per_cell = BEVGrid.from_scan(scan, BEVConfig(ground_mode="height_diff"))
+    plane = BEVGrid.from_scan(scan, BEVConfig(ground_mode="plane"))
+    assert per_cell.occupied_fraction < plane.occupied_fraction
+
+    # Straight ahead down the lane, the plane mode reports markedly less clearance.
+    ahead = np.array([[30.0, 0.0]])
+    assert (per_cell.distance_to_obstacles(ahead)[0]
+            > plane.distance_to_obstacles(ahead)[0])
+
+
+def test_the_lane_ahead_is_not_reported_as_blocked(drive):
+    """Sanity that the car's own lane is drivable — the scan was recorded while driving it."""
+    grid = BEVGrid.from_scan(drive.velodyne(0))
+    ahead = np.stack([np.arange(3.0, 25.0, 1.0), np.zeros(22)], axis=1)
+    assert np.median(grid.distance_to_obstacles(ahead)) > 1.0
+
+
+def test_lidar_frame_count_can_be_short_of_the_image_count(drive):
+    """Drive 0009 ships 447 images and OXTS packets but only 443 Velodyne scans.
+
+    Real datasets have holes. Anything iterating lidar must bound on `n_velodyne`, and
+    overrunning it should say so rather than raising from inside pykitti's file list.
+    """
+    full = KittiDrive("2011_09_26", "0009")
+    assert full.n_velodyne == 443 and len(full) == 447
+    with pytest.raises(IndexError, match="out of range"):
+        full.velodyne(full.n_velodyne)
+
+
+def test_the_rear_axle_is_offset_from_the_lidar_origin(drive):
+    """The Velodyne is roof-mounted ahead of the rear axle; conflating them misplaces the car.
+
+    Treating the lidar origin as the vehicle reference point pushed a 4.77 m car 0.8 m too
+    far forward, which corrupted every clearance query against real scans.
+    """
+    offset = drive.rear_axle_in_lidar
+    assert offset.shape == (2,)
+    assert offset[0] == pytest.approx(-0.81, abs=0.05)   # axle sits behind the lidar
+    assert np.linalg.norm(offset) > 0.5
+
+    state = drive.vehicle_state_in_lidar(speed=5.0)
+    assert (state.x, state.y) == pytest.approx(tuple(offset))
+    assert state.v == 5.0
+
+
+def test_correct_axle_placement_reports_more_clearance_than_the_lidar_origin(drive):
+    """Regression on the fix: the mistake made the car appear ~0.8 m deeper into the scene."""
+    grid = BEVGrid.from_scan(drive.velodyne(0))
+    vcfg = VehicleConfig()
+    at_origin = clearance(VehicleState(), grid, vcfg)
+    at_axle = clearance(drive.vehicle_state_in_lidar(), grid, vcfg)
+    assert at_axle > at_origin
+
+
+def test_shield_permits_more_speed_than_the_driver_used_on_open_road(drive):
+    """The shield expressed as a speed limit, compared against a real human driver.
+
+    On the open lane at the start of this drive the constraint should not bind — a shield
+    that already overrules the recorded driver here would be uselessly timid.
+    """
+    vcfg = VehicleConfig(max_speed=35.0)
+    state = drive.vehicle_state_in_lidar()
+    for i in (0, 5, 10):
+        permitted = max_safe_speed(BEVGrid.from_scan(drive.velodyne(i)), vcfg, state=state)
+        assert permitted > drive.speeds[i], f"frame {i}: shield would slow an open-road drive"
+
+
+def test_shield_runs_on_real_lidar_within_its_grid(drive):
+    """End to end on real data: grid extent covers the braking envelope and the shield runs."""
+    vcfg, grid = VehicleConfig(), BEVGrid.from_scan(drive.velodyne(0))
+    assert grid.covers_stopping_distance(stopping_distance(vcfg.max_speed, vcfg))
+
+    res = safety_shield(vcfg.max_accel, 0.0, VehicleState(v=float(drive.speeds[0])),
+                        grid, vcfg)
+    assert np.isfinite(res.accel) and not res.ics
+    assert -vcfg.max_decel <= res.accel <= vcfg.max_accel
 
 
 # --- end-to-end odometry -------------------------------------------------------------------
