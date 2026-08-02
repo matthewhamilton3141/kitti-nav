@@ -248,25 +248,37 @@ success (66% → 70%). That reads oddly until you notice a collision ends the ep
 failure: the shield converts would-be crashes into driving that sometimes still reaches the
 goal.
 
-### A negative result worth stating plainly
+### A negative result, replicated across 5 training seeds
 
 **Training through the shield did not beat simply bolting it on at evaluation — contradicting
 what gsplat-rt found.** There, shield-in-the-loop strictly dominated (100%/0/56 vs 98%/4/58).
-Here, at 600 episodes:
 
-| policy | success (95% CI) | collisions |
-| --- | --- | ---: |
-| PPO (raw) + shield at eval | 66.0% ± 3.8% | 0 |
-| PPO trained through the shield | 67.7% ± 3.7% | 0 |
+This is a claim about a *training method*, so the unit of replication has to be the training
+run, not the episode — a single run cannot separate a real effect from one lucky weight
+initialisation. Five independently seeded policies per configuration, each scored on the
+**same** 200 evaluation scenes:
 
-Overlapping intervals — the gap is noise. The likely reason is in the row above: eval-time
-shielding already costs this policy nothing, so there is no penalty left for in-loop training
-to recover. In gsplat-rt the shield *did* cost real performance when bolted on (98%/4 →
-95%/0, 58 → 79 steps), and closing that gap is what in-loop training achieved. A shield
-that is already free leaves nothing on the table.
+| scenes | PPO (raw) + shield at eval | PPO trained through shield | difference |
+| --- | --- | --- | --- |
+| synthetic | 71.9% ± 1.5% | 72.0% ± 2.9% | +0.1%, 95% CI [−3.5, +3.7], p = 0.95 |
+| KITTI (real) | 76.2% ± 1.0% | 77.3% ± 1.2% | +1.1%, 95% CI [−0.5, +2.7], p = 0.14 |
 
-Single seed, one drive, 600k steps — the claim is only that in-loop training showed no
-measurable advantage *here*, which is much weaker than saying it never helps.
+Neither is significant, and **0 collisions in all 10 runs**.
+
+The interval matters more than the p-value here. On KITTI it caps any real effect at **+2.7
+points**, and 4 of 5 seeds do favour in-loop training — so a small genuine benefit isn't
+excluded, and "not significant" isn't "no effect." What *is* excluded is anything near the
+magnitude gsplat-rt reported. The defensible claim: **not that in-loop training never helps,
+but that its large win there does not reproduce here.**
+
+Why: eval-time shielding already costs this policy nothing (on synthetic scenes it *helps*),
+so there's no penalty left for in-loop training to recover. In gsplat-rt the shield *did*
+cost real performance bolted on (98%/4 → 95%/0, 58 → 79 steps), and closing that gap is what
+in-loop training achieved. A shield that is already free leaves nothing on the table.
+
+Seed-to-seed spread came out small (1.0–2.9 points), well under the deep-RL norm where seed
+variance swamps algorithmic differences — which is why 5 seeds sufficed to bound the effect.
+Caveats remain: one drive, one hyperparameter set, 600k steps.
 
 ## Layout
 
