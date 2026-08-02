@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Compare every policy on synthetic scenes and on real recorded KITTI geometry.
+
+    python3 scripts/eval_policies.py --episodes 200
+
+Reports the full arc the way `gsplat-rt`'s nav flagship did: heuristic -> heuristic+shield ->
+learned -> learned+shield -> learned *trained through* the shield. Success rate and collision
+count are the two numbers that matter, and they trade off against each other, so both are
+always shown together.
+
+The KITTI column is the transfer test: every policy is trained only on synthetic obstacle
+fields, then evaluated on occupancy grids built from real Velodyne scans.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from dataclasses import replace
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from kitti_nav.nav_env import (                     # noqa: E402
+    DriveNavConfig,
+    DriveNavEnv,
+    KittiScenes,
+    SyntheticScenes,
+    evaluate,
+    gap_following_policy,
+)
+
+
+def load_ppo(path: Path):
+    """Wrap a saved stable-baselines3 policy as a plain `obs -> action` callable."""
+    from stable_baselines3 import PPO
+
+    model = PPO.load(str(path), device="cpu")
+
+    def policy(obs: np.ndarray) -> np.ndarray:
+        action, _ = model.predict(obs, deterministic=True)
+        return action
+    return policy
+
+
+def scene_sources(args):
+    sources = {"synthetic": lambda: SyntheticScenes()}
+    if not args.no_kitti:
+        from kitti_nav.kitti import KittiDrive
+
+        drive = KittiDrive(args.date, args.drive)
+        sources["KITTI (real)"] = lambda: KittiScenes(drive=drive)
+    return sources
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--episodes", type=int, default=200)
+    p.add_argument("--models", type=Path, default=Path("models"))
+    p.add_argument("--date", default="2011_09_26")
+    p.add_argument("--drive", default="0009")
+    p.add_argument("--no-kitti", action="store_true", help="synthetic scenes only")
+    args = p.parse_args()
+
+    base = DriveNavConfig()
+    shielded = replace(base, use_shield=True)
+
+    # (label, config used at evaluation time, policy factory)
+    rows: list[tuple[str, DriveNavConfig, object]] = [
+        ("gap-following", base, lambda: (lambda o: gap_following_policy(o, base))),
+        ("gap-following + shield", shielded,
+         lambda: (lambda o: gap_following_policy(o, shielded))),
+    ]
+    raw, shield_trained = args.models / "ppo_raw", args.models / "ppo_shielded"
+    if raw.with_suffix(".zip").exists():
+        rows.append(("PPO (raw)", base, lambda: load_ppo(raw)))
+        rows.append(("PPO (raw) + shield at eval", shielded, lambda: load_ppo(raw)))
+    if shield_trained.with_suffix(".zip").exists():
+        rows.append(("PPO trained through shield", shielded, lambda: load_ppo(shield_trained)))
+
+    for scene_name, make_scenes in scene_sources(args).items():
+        print(f"\n=== {scene_name} scenes, {args.episodes} episodes ===")
+        print(f"{'policy':<30} {'success':>8} {'collisions':>11} {'reward':>8} {'steps':>7}")
+        print("-" * 68)
+        for label, cfg, make_policy in rows:
+            env = DriveNavEnv(make_scenes(), cfg)
+            stats = evaluate(env, make_policy(), n_episodes=args.episodes)
+            print(f"{label:<30} {stats['success_rate']:>7.0%} {stats['collisions']:>11} "
+                  f"{stats['mean_reward']:>8.1f} {stats['mean_steps_when_reached']:>7.0f}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

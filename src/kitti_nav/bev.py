@@ -265,6 +265,42 @@ class BEVGrid:
             out[inside] = self.distance_field[sel[:, 0], sel[:, 1]]
         return out
 
+    def ray_distances(self, origin: np.ndarray, yaw: float, angles: np.ndarray,
+                      max_range: float = 30.0,
+                      outside_blocks: bool = True) -> np.ndarray:
+        """Cast a fan of rays from `origin` and return the free distance (m) along each.
+
+        The observation a learned policy consumes. Ray marching, not analytic intersection,
+        because the obstacles are a raster: stepping at half a cell guarantees no occupied
+        cell is skipped (Nyquist on the grid), and the whole fan is vectorised into one
+        array lookup rather than a Python loop per ray.
+
+        `angles` are relative to `yaw`. Rays leaving the grid stop there when
+        `outside_blocks`, which treats the edge of what the sensor mapped as a wall — the
+        honest reading, since unmapped space is unknown rather than known-clear.
+        """
+        rows, cols = self.cfg.shape
+        step = self.cfg.resolution * 0.5
+        t = np.arange(0.0, max_range + step, step)                    # (S,)
+        dirs = yaw + np.asarray(angles, float).reshape(-1)            # (R,)
+
+        px = origin[0] + np.cos(dirs)[:, None] * t[None, :]           # (R, S)
+        py = origin[1] + np.sin(dirs)[:, None] * t[None, :]
+
+        r = ((px - self.cfg.x_min) / self.cfg.resolution).astype(np.int32)
+        c = ((py - self.cfg.y_min) / self.cfg.resolution).astype(np.int32)
+        inside = (r >= 0) & (r < rows) & (c >= 0) & (c < cols)
+
+        blocked = np.zeros(px.shape, bool)
+        blocked[inside] = self.occupancy[r[inside], c[inside]] > 0
+        if outside_blocks:
+            blocked |= ~inside
+
+        # First blocked sample per ray; rays that never hit return the full range.
+        any_hit = blocked.any(axis=1)
+        first = np.where(any_hit, blocked.argmax(axis=1), len(t) - 1)
+        return np.minimum(t[first], max_range)
+
     def covers_stopping_distance(self, distance: float) -> bool:
         """Does the grid extend far enough ahead to certify a stop of `distance` metres?
 

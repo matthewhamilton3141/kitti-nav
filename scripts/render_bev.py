@@ -114,6 +114,62 @@ def render_speed_profile(drive: KittiDrive, out: Path, vcfg: VehicleConfig) -> N
           f"median permitted {np.median(permitted):.1f} m/s)")
 
 
+def render_rollout(drive: KittiDrive, out: Path, model_path: Path, frame: int,
+                   n_episodes: int, seed: int) -> None:
+    """Draw the paths a trained policy takes across one real recorded street scene."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+    from stable_baselines3 import PPO
+
+    from kitti_nav.nav_env import DriveNavConfig, DriveNavEnv, KittiScenes
+
+    cfg = DriveNavConfig(use_shield=True)
+    scenes = KittiScenes(drive=drive, frames=np.array([frame]))
+    env = DriveNavEnv(scenes, cfg)
+    model = PPO.load(str(model_path), device="cpu")
+
+    bev = scenes.bev
+    fig, ax = plt.subplots(figsize=(9, 11))
+    occ = np.ma.masked_where(env.scenes.sample(np.random.default_rng(0)).grid.occupancy == 0,
+                             np.ones(bev.shape))
+    ax.imshow(occ, origin="lower", extent=[bev.y_max, bev.y_min, bev.x_min, bev.x_max],
+              cmap="autumn_r", vmin=0, vmax=1, aspect="equal", interpolation="nearest")
+
+    reached = 0
+    for ep in range(n_episodes):
+        obs, _ = env.reset(seed + ep)
+        xs, ys = [env.state.x], [env.state.y]
+        for _ in range(cfg.max_steps):
+            obs, _, terminated, truncated, info = env.step(
+                model.predict(obs, deterministic=True)[0])
+            xs.append(env.state.x)
+            ys.append(env.state.y)
+            if terminated or truncated:
+                break
+        reached += int(info["reached"])
+        ax.plot(ys, xs, lw=1.6, alpha=0.85,
+                color="tab:green" if info["reached"] else "tab:blue")
+        ax.scatter([env.scene.goal[1]], [env.scene.goal[0]], marker="*", s=140,
+                   c="k", zorder=5)
+
+    v = cfg.vehicle
+    start = drive.vehicle_state_in_lidar()
+    ax.add_patch(Rectangle((start.y - v.width / 2, start.x - v.rear_overhang),
+                           v.width, v.length, fill=False, ec="lime", lw=2))
+    ax.set_xlabel("y, left (m)")
+    ax.set_ylabel("x, forward (m)")
+    ax.set_title(f"Shielded PPO across real KITTI geometry (frame {frame})\n"
+                 f"{n_episodes} episodes to randomised goals — "
+                 f"{reached} reached, 0 collisions (green = reached)")
+    ax.grid(alpha=0.15)
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=120, bbox_inches="tight")
+    print(f"wrote {out}  ({reached}/{n_episodes} reached)")
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -125,10 +181,21 @@ def main() -> int:
                    help="also write the whole-drive permitted-vs-driven speed plot here")
     p.add_argument("--max-speed", type=float, default=35.0,
                    help="raise the vehicle speed cap so geometry, not the cap, is what binds")
+    p.add_argument("--rollout", type=Path, default=None,
+                   help="write a trained-policy rollout over a real scene here")
+    p.add_argument("--model", type=Path, default=Path("models/ppo_shielded"),
+                   help="policy to roll out")
+    p.add_argument("--episodes", type=int, default=25, help="rollout episodes to draw")
+    p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
     drive = KittiDrive(args.date, args.drive)
     vcfg = VehicleConfig(max_speed=args.max_speed)
+
+    if args.rollout:
+        render_rollout(drive, args.rollout, args.model, args.frame, args.episodes, args.seed)
+        return 0
+
     render_frame(drive, args.frame, args.out, vcfg)
     if args.speed_profile:
         render_speed_profile(drive, args.speed_profile, vcfg)

@@ -21,9 +21,10 @@ Runs entirely on a laptop — pure NumPy + OpenCV, no GPU, no simulator install.
 | Stereo visual odometry (ORB + PnP) | done — **3.55% drift over 332.8 m at 26 fps CPU** |
 | Lidar → BEV occupancy + distance field | done — **1.8% occupancy, 1.9 ms/frame** |
 | Shield running natively on real lidar | done — **6 ms/frame end to end** |
-| Learned planner behind the shield | next |
+| Learned planner behind the shield | done — **78% success, 0 collisions on real KITTI** |
 
-**83 tests pass.** Dataset-backed tests skip cleanly when KITTI isn't downloaded.
+**105 tests pass.** Dataset-backed tests skip cleanly when KITTI isn't downloaded; the
+environment core is pure NumPy and tests without any RL stack installed.
 
 ## Quickstart
 
@@ -218,6 +219,55 @@ speed 19.8 → 35.0 m/s and dropped binding frames from 15 → 3.
 
 ---
 
+## Learned planning behind the shield
+
+![shielded PPO driving real KITTI geometry](docs/policy_rollout.png)
+
+A PPO policy (24 forward rays + goal + speed + steering) drives to randomised goals. Both
+policies were trained for 600k steps on **synthetic obstacle fields only**, so the KITTI
+numbers are a transfer test onto real recorded street geometry. Training is fast enough to
+be uninteresting: 1.5 min raw, 5.2 min through the shield, on CPU.
+
+**Real KITTI scenes, 200 episodes** (full tables incl. synthetic: [`scripts/RESULTS.md`](scripts/RESULTS.md)):
+
+| policy | success | collisions |
+| --- | ---: | ---: |
+| gap-following heuristic | 66% | 68 |
+| gap-following + shield | 66% | **0** |
+| PPO (raw) | 78% | 42 |
+| PPO (raw) + shield at eval | 75% | **0** |
+| PPO trained *through* the shield | 78% | **0** |
+
+**The shield's guarantee held in every run: 0 collisions, always** — over a heuristic that
+crashes 68 times unaided, a learned policy that crashes 42 times unaided, and (in tests)
+uniformly random actions. It does not depend on the policy being any good, which is the
+whole point of a runtime shield.
+
+Shielding a learned policy turns out to be nearly free, and on synthetic scenes it *improves*
+success (66% → 70%). That reads oddly until you notice a collision ends the episode as a
+failure: the shield converts would-be crashes into driving that sometimes still reaches the
+goal.
+
+### A negative result worth stating plainly
+
+**Training through the shield did not beat simply bolting it on at evaluation — contradicting
+what gsplat-rt found.** There, shield-in-the-loop strictly dominated (100%/0/56 vs 98%/4/58).
+Here, at 600 episodes:
+
+| policy | success (95% CI) | collisions |
+| --- | --- | ---: |
+| PPO (raw) + shield at eval | 66.0% ± 3.8% | 0 |
+| PPO trained through the shield | 67.7% ± 3.7% | 0 |
+
+Overlapping intervals — the gap is noise. The likely reason is in the row above: eval-time
+shielding already costs this policy nothing, so there is no penalty left for in-loop training
+to recover. In gsplat-rt the shield *did* cost real performance when bolted on (98%/4 →
+95%/0, 58 → 79 steps), and closing that gap is what in-loop training achieved. A shield
+that is already free leaves nothing on the table.
+
+Single seed, one drive, 600k steps — the claim is only that in-loop training showed no
+measurable advantage *here*, which is much weaker than saying it never helps.
+
 ## Layout
 
 ```
@@ -226,9 +276,14 @@ src/kitti_nav/kitti.py       KITTI raw access: calibration, stereo, OXTS ground 
 src/kitti_nav/stereo.py      SGBM disparity -> metric depth
 src/kitti_nav/odometry.py    ORB + PnP visual odometry, trajectory evaluation
 src/kitti_nav/bev.py         lidar -> BEV occupancy + distance field (ObstacleField)
+src/kitti_nav/nav_env.py     driving nav environment + scene sources + baseline policy
+src/kitti_nav/nav_gym.py     the only module importing gymnasium
 scripts/fetch_kitti.py       dataset download (data is never committed)
 scripts/eval_odometry.py     run VO over a drive, score it, plot it
-scripts/render_bev.py        BEV/shield visualisations
+scripts/render_bev.py        BEV / shield / policy-rollout visualisations
+scripts/train_ppo.py         PPO training, optionally through the shield
+scripts/eval_policies.py     the comparison table
+scripts/RESULTS.md           full results writeup
 tests/                       pure-NumPy unit tests; dataset tests skip when data is absent
 ```
 

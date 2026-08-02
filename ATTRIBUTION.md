@@ -31,7 +31,28 @@ source also carries a provenance header in the file that uses it.
   stereo imagery, and Velodyne scans. Adopted rather than hand-rolling a parser.
 
 ### OpenCV
-- **License:** Apache 2.0. Used for the ORB feature front-end and stereo matching.
+- **License:** Apache 2.0. Used for the ORB feature front-end, SGBM stereo matching, and
+  the exact Euclidean distance transform behind the BEV clearance field.
+
+### Stable-Baselines3
+- **Source:** <https://github.com/DLR-RM/stable-baselines3>
+- **Authors:** Antonin Raffin et al. (DLR-RM).
+- **License:** MIT.
+- **Used for:** the PPO implementation that trains the driving policy. Adopted rather than
+  writing PPO from scratch — a from-scratch implementation would be a source of subtle bugs
+  competing with the part of this project that is actually novel.
+- **Citation:**
+  > A. Raffin, A. Hill, A. Gleave, A. Kanervisto, M. Ernestus, N. Dormann.
+  > *Stable-Baselines3: Reliable Reinforcement Learning Implementations.*
+  > Journal of Machine Learning Research, 2021.
+
+### Gymnasium
+- **Source:** <https://github.com/Farama-Foundation/Gymnasium> (Farama Foundation).
+- **License:** MIT. The RL environment API; confined to `src/kitti_nav/nav_gym.py` so the
+  environment core stays dependency-free.
+
+### PyTorch
+- **License:** BSD-3-Clause. The policy network backing PPO (CPU only here).
 
 ## Prior work by this author
 
