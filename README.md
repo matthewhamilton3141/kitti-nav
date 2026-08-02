@@ -16,12 +16,14 @@ Runs entirely on a laptop — pure NumPy core, no GPU, no simulator install.
 
 | Piece | State |
 | --- | --- |
-| Kinematic bicycle (Ackermann) vehicle model | done, 20 tests |
+| Kinematic bicycle (Ackermann) vehicle model | done, tested |
 | Braking-aware safety shield | done, tested — incl. a fuzz test that found a real soundness bug |
-| KITTI raw loading (stereo + lidar + OXTS ground truth) | verified on drive `2011_09_26_0009` |
-| Stereo/ORB visual odometry | next |
+| KITTI raw loading (stereo + lidar + OXTS ground truth) | done, verified on drive `2011_09_26_0009` |
+| Stereo visual odometry (ORB + PnP) | done — **3.55% drift over 332.8 m at 26 fps CPU** |
 | Lidar → BEV occupancy grid | next |
 | Learned planner behind the shield | after the above |
+
+45 tests pass; the dataset-backed ones skip cleanly when KITTI isn't downloaded.
 
 ## Quickstart
 
@@ -72,12 +74,54 @@ Known limitation, stated plainly: the shield chooses between the commanded steer
 held steer — it never searches for an *evasive* one, so it will brake for obstacles it might
 have swerved around.
 
+## Stereo visual odometry
+
+```bash
+python3 scripts/eval_odometry.py --plot docs/trajectory.png
+```
+
+![estimated vs ground-truth trajectory](docs/trajectory.png)
+
+Measured on the full 447-frame drive, against OXTS ground truth:
+
+| metric | value |
+| --- | --- |
+| ATE RMSE | 6.83 m |
+| final drift | 11.82 m over 332.8 m — **3.55%** |
+| speed | 16.9 s for 447 frames — **26.4 fps**, single-threaded CPU |
+| tracking | 1064 mean matches, 377 mean PnP inliers, **0 fallback steps** |
+
+ORB features → ratio-tested matching → back-project through stereo depth →
+`solvePnPRansac` → compose. The geometry is adapted from `gsplat-rt`'s
+`rgbd_odometry.py`, with two things that changed for driving:
+
+**Stereo removes the scale problem entirely.** `gsplat-rt` estimated depth with a monocular
+network, whose output is only defined up to scale — an entire subsystem existed to recover
+metric scale, and residual scale drift was the dominant error. Here `depth = fx·b/disparity`
+is metric by construction. There is nothing to estimate and nothing to drift.
+
+**So the evaluation does not apply Sim(3) alignment.** Monocular VO papers fit a scale factor
+before reporting ATE, because scale is genuinely unknowable from monocular input. Doing that
+for stereo would quietly absorb real scale error and flatter the number. The 3.55% above is
+raw, and a test (`test_evaluation_does_not_secretly_rescale_the_estimate`) pins that choice
+down so it can't regress into a nicer-looking lie.
+
+**What 3.55% honestly is:** a respectable frame-to-frame VO result and clearly *not*
+state-of-the-art. There is no bundle adjustment, no keyframing, no loop closure — error
+accumulates monotonically, which is exactly what the plot shows. The known levers, in rough
+order of payoff: local bundle adjustment, keyframe tracking (drafted in `gsplat-rt`), and a
+learned front-end (SuperPoint+LightGlue beat ORB there, 3.5 cm vs 5.7 cm ATE on TUM).
+
 ## Layout
 
 ```
-src/kitti_nav/vehicle.py   bicycle model, footprint geometry, braking shield
-scripts/fetch_kitti.py     dataset download (data is never committed)
-tests/                     pure-NumPy, no GPU, no dataset needed
+src/kitti_nav/vehicle.py     bicycle model, footprint geometry, braking shield
+src/kitti_nav/kitti.py       KITTI raw access: calibration, stereo, OXTS ground truth
+src/kitti_nav/stereo.py      SGBM disparity -> metric depth
+src/kitti_nav/odometry.py    ORB + PnP visual odometry, trajectory evaluation
+scripts/fetch_kitti.py       dataset download (data is never committed)
+scripts/eval_odometry.py     run VO over a drive, score it, plot it
+tests/                       pure-NumPy unit tests; dataset tests skip when data is absent
 ```
 
 ## Attribution
