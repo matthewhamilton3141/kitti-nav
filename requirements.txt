@@ -1,0 +1,5 @@
+numpy>=1.23.0
+opencv-python>=4.8.0        # ORB front-end + stereo matching
+pykitti>=0.3.1              # KITTI raw loader (MIT, utiasSTARS) — see ATTRIBUTION.md
+matplotlib>=3.7.0           # trajectory / BEV plots
+pytest>=7.4.0

@@ -1,0 +1,12 @@
+# KITTI data is large and CC BY-NC-SA licensed — never committed, always downloaded.
+data/
+*.zip
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+.DS_Store
