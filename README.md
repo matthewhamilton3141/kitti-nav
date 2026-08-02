@@ -19,9 +19,10 @@ Runs entirely on a laptop — pure NumPy + OpenCV, no GPU, no simulator install.
 | Braking-aware safety shield | done — a fuzz test found a real soundness bug in it |
 | KITTI raw loading (stereo + lidar + OXTS ground truth) | done |
 | Stereo visual odometry (ORB + PnP) | done — **3.55% drift over 332.8 m at 26 fps CPU** |
-| Lidar → BEV occupancy + distance field | done — **1.8% occupancy, 1.9 ms/frame** |
+| Lidar → BEV occupancy + distance field | done — **4.3% occupancy, 2.1 ms/frame** |
 | Shield running natively on real lidar | done — **6 ms/frame end to end** |
 | Learned planner behind the shield | done — **78% success, 0 collisions on real KITTI** |
+| VO poses + lidar fused into an accumulated map | done — **1.9× the scene mapped at 5 scans** |
 
 **105 tests pass.** Dataset-backed tests skip cleanly when KITTI isn't downloaded; the
 environment core is pure NumPy and tests without any RL stack installed.
@@ -35,6 +36,7 @@ python3 -m pytest tests/ -q
 
 python3 scripts/eval_odometry.py --plot docs/trajectory.png
 python3 scripts/render_bev.py --frame 294 --speed-profile docs/speed_profile.png
+python3 scripts/eval_mapping.py --sweep 1 2 3 5 10 20 --max-speed 21 --plot docs/mapping.png
 ```
 
 Data lands in gitignored `data/kitti_raw/`. Drive `2011_09_26_0009` is 447 frames covering
@@ -168,7 +170,7 @@ IMU and camera are ~1.1 m and a ~90° rotation apart, so comparing VO against ra
 
 ![lidar BEV occupancy with the shield's verdict](docs/bev.png)
 
-Velodyne scans (~122k points) rasterise into a top-down grid at **1.9 ms/frame**, everything
+Velodyne scans (~122k points) rasterise into a top-down grid at **2.1 ms/frame**, everything
 staying in the lidar frame (+x forward, +y left) — which is already the bicycle model's frame,
 so the planner consumes the grid with no axis juggling.
 
@@ -177,16 +179,24 @@ so the planner consumes the grid with no axis juggling.
 Removing road returns is the whole ballgame; without it the grid is uniformly occupied. Two
 strategies are implemented and the default was picked by measuring, not assuming:
 
-| mode | occupied | clearance 30 m ahead | time |
-| --- | --- | --- | --- |
-| `plane` — fixed height band above a global ground height | 6.23% | **2.58 m** | 2.4 ms |
-| `height_diff` — local per-cell ground *(default)* | **1.82%** | **6.04 m** | 1.9 ms |
+| mode | occupied (frame 0) | occupied (drive mean) | clearance 30 m ahead | time |
+| --- | --- | --- | --- | --- |
+| `plane` — fixed height band above a global ground height | 3.65% | 8.23% | **2.58 m** | **1.3 ms** |
+| `height_diff` — local per-cell ground *(default)* | **2.40%** | **4.33%** | **5.96 m** | 2.1 ms |
+
+<sub>Re-measured 2026-08-02. An earlier version of this table reported 6.23% / 1.82%
+occupancy and had `height_diff` as the *faster* mode. Neither reproduces on the current
+code, so both are corrected here. The occupancy figures predate `ground_z` defaulting to
+−1.73 m (leaving it unset gives 6.7–7.6%, which brackets the old plane number), and
+`height_diff` is in fact the slower mode — it runs two passes plus a min-filter. The
+clearance figures do reproduce (2.58 m exactly; 6.04 → 5.96 m).</sub>
 
 KITTI documents the lidar 1.73 m above the ground, but near-field returns on this drive
 spread ~0.4 m in `z` and are visibly bimodal — sensor pitch plus real road slope — so no
 single constant is right across the scan. The plane mode's extra cells are road surface
 drifting out of the band: **phantom obstacles that would brake the car for open road.** The
-per-cell estimate follows the road instead, and is both more accurate and faster.
+per-cell estimate follows the road instead. It costs 0.8 ms more, which is not the binding
+constraint at 10 Hz, and buys half the occupancy and 2.3× the forward clearance.
 
 Ground is estimated over a small *neighbourhood* rather than a single cell, because many
 cells hold no ground return at all (lidar rings spread with range; nothing under an overhang
@@ -216,6 +226,94 @@ axle**, and the bicycle model's pose *is* the rear axle. Placing the vehicle at 
 origin pushed a 4.77 m car most of a metre too far forward and corrupted every clearance
 query. Fixing it (plus tightening the disc cover from 3 to 5 discs) moved median permitted
 speed 19.8 → 35.0 m/s and dropped binding frames from 15 → 3.
+
+---
+
+## Fusing odometry into the map
+
+![accumulated-map sweep](docs/mapping.png)
+
+Until this point the repo had two good halves that never spoke. `odometry.py` estimated a
+trajectory nothing consumed; `bev.py` built the planner's map from a **single frozen scan**,
+discarding everything the sensor saw a tenth of a second earlier. `mapping.py` joins them:
+scans are transformed into the current Velodyne frame through the estimated poses and
+rasterised together.
+
+Three maps are built at each frame and compared — one scan (the old behaviour), accumulation
+with OXTS **ground-truth** poses (the ceiling), and accumulation with this repo's **stereo
+VO** (the honest number). 36 frames of drive 0009, speed cap 21 m/s:
+
+| scans fused | pose error *over the window* | scene mapped | IoU vs GT-pose map | real cells lost | permitted speed, GT / VO | frames VO is optimistic |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 6.8 cm | 1.00× | 0.997 | 0.19% | 16.38 / 16.38 | 0/36 |
+| 2 | 10.9 cm | 1.28× | 0.902 | 5.14% | 16.13 / 16.14 | 2/36 (+0.21) |
+| 3 | 15.0 cm | 1.50× | 0.866 | 6.96% | 15.13 / 15.11 | 2/36 (+0.21) |
+| **5** | **24.1 cm** | **1.86×** | **0.811** | **10.10%** | **13.36 / 13.37** | **3/36 (+0.57)** |
+| 10 | 45.5 cm | 2.71× | 0.724 | 15.51% | 10.99 / 11.25 | 9/36 (**+4.39**) |
+| 20 | 84.4 cm | 3.94× | 0.639 | 21.11% | 8.61 / 8.47 | 7/36 (**+7.38**) |
+
+The `window = 1` row is the control: with one scan the pose cannot matter, so all three maps
+must agree, and they do. Anything else there would be a transform bug rather than a result.
+
+**Global drift is the wrong thing to worry about.** VO ends the drive 12.06 m from truth —
+3.55% — which sounds fatal for map-building. It isn't, because a fused map never composes
+poses across more than its own window. What governs it is the *relative* pose error over
+those few tenths of a second: 24 cm at five scans, two orders of magnitude below the global
+figure. That is why the VO column tracks the ground-truth column almost exactly up to five
+scans (13.37 vs 13.36 m/s permitted).
+
+**The single-scan map was optimistic because it was blind.** It permits 16.38 m/s while the
+five-scan ground-truth map permits 13.36, and that gap is not the fused map being timid: the
+single scan is missing **44% of the occupied cells** the fused map contains. Connecting
+odometry to the map makes the planner slower and better informed, in that order.
+
+**Where it breaks.** Between 5 and 10 scans the unsafe direction turns on sharply — frames
+where the VO map permits *more* speed than the ground-truth map go 3/36 to 9/36, and the
+worst excursion goes +0.57 to +4.39 m/s. Five scans is the operating point this drive
+supports.
+
+Errors are reported split by direction rather than as one similarity score, because they are
+not equally bad. **Phantom** cells (invented by mis-registration) cost speed and cannot cause
+a crash; **missed** cells are real geometry the map lost, and only those can hurt. A single
+IoU would let the second hide inside the first.
+
+### The bug this found: the car mapping itself as a wall
+
+Accumulation initially drove the shield-permitted speed from 25.1 m/s to **2.2 m/s**, with
+phantom obstacles inside the vehicle's own footprint — and it did so with *perfect* poses, so
+it was never drift.
+
+A roof-mounted Velodyne sees its own car: the hood, the roof rails, the mirrors. In a single
+scan those cells contain *only* bodywork, so `bev.py`'s per-cell ground estimate takes the
+bodywork as the ground, measures no height above it, and calls the cell free. **The map was
+right by accident.** Accumulate two scans and an earlier viewpoint supplies the road surface
+at that spot — seen from behind, before the car arrived — so the cell now holds road at
+−1.73 m and bodywork at −0.92 m. That 0.81 m spread reads as an obstacle.
+
+The fix is standard lidar-stack self-filtering: drop returns inside a box around the sensor,
+in the sensor's own frame, before any pose transform. The box is *measured* rather than
+derived from the vehicle rectangle — the body rectangle is anchored at the rear axle, 0.32 m
+off the lidar centreline, while the self-returns are symmetric about the sensor and reach
+1.5 m laterally, past the 0.91 m half-width, because roof rails and mirrors are not part of
+the body. `scripts/eval_mapping.py --audit-ego` re-derives it from the data, and a test
+fails if it drifts. Cost on a single scan: 41 returns, **zero** occupancy cells changed.
+
+Two things had to be right to find it. The self-returns are identified by persisting at a
+*fixed position in the sensor frame*, and roadside structure does that too while the car
+holds its lane — searching without a lateral bound returns a kerb line at y ≈ −2.3 m present
+in 100% of scans.
+
+### Stated honestly
+
+- **Dynamic actors are a confound.** Some of the occupancy accumulation adds is moving
+  traffic smeared into trails, not revealed static geometry, and with GT poses the two are
+  not separable here. Free-space carving (ray-casting each scan to clear what it saw through)
+  is the standard fix and is not implemented.
+- **The far field runs out of grid.** The largest optimistic excursions are obstacles near
+  `x_max = 50 m` that drift moves across the boundary, where `outside_is_free=True` reads
+  them as clear. This is also why the sweep caps speed at 21 m/s: `sqrt(2 · 4.5 · 50)` is the
+  fastest the shield can certify with a 50 m map, and any figure above it is the grid's
+  assumption talking, not the sensor.
 
 ---
 
@@ -288,10 +386,12 @@ src/kitti_nav/kitti.py       KITTI raw access: calibration, stereo, OXTS ground 
 src/kitti_nav/stereo.py      SGBM disparity -> metric depth
 src/kitti_nav/odometry.py    ORB + PnP visual odometry, trajectory evaluation
 src/kitti_nav/bev.py         lidar -> BEV occupancy + distance field (ObstacleField)
+src/kitti_nav/mapping.py     pose + scan fusion into an accumulated map; ego self-filter
 src/kitti_nav/nav_env.py     driving nav environment + scene sources + baseline policy
 src/kitti_nav/nav_gym.py     the only module importing gymnasium
 scripts/fetch_kitti.py       dataset download (data is never committed)
 scripts/eval_odometry.py     run VO over a drive, score it, plot it
+scripts/eval_mapping.py      single vs GT-pose vs VO-pose maps; --audit-ego, --sweep
 scripts/render_bev.py        BEV / shield / policy-rollout visualisations
 scripts/train_ppo.py         PPO training, optionally through the shield
 scripts/eval_policies.py     the comparison table

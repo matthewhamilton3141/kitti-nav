@@ -111,9 +111,63 @@ success rates also shift with the evaluation scene set (a 600-episode set scored
 seed-0 policies ~5 points lower than the 200-episode set), which is why only within-table
 comparisons on identical scenes are meaningful.
 
+## Accumulated mapping — fusing odometry poses into the planner's map
+
+Separate experiment, same drive. Full narrative in the README; the numbers are here.
+
+Three maps per frame: one scan (the behaviour everything above was measured against),
+accumulation with OXTS ground-truth poses (the ceiling), accumulation with stereo VO (the
+honest number). 36 frames of drive 0009, speed cap 21 m/s — `sqrt(2 · 4.5 · 50)`, the
+fastest a 50 m grid can certify a stop from, above which the figure reflects
+`outside_is_free` rather than the sensor.
+
+| scans | pose error over window | mapped | IoU vs GT | real cells lost | permitted GT / VO | VO optimistic |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 6.8 cm | 1.00× | 0.997 | 0.19% | 16.38 / 16.38 | 0/36 |
+| 2 | 10.9 cm | 1.28× | 0.902 | 5.14% | 16.13 / 16.14 | 2/36 (+0.21) |
+| 3 | 15.0 cm | 1.50× | 0.866 | 6.96% | 15.13 / 15.11 | 2/36 (+0.21) |
+| **5** | **24.1 cm** | **1.86×** | **0.811** | **10.10%** | **13.36 / 13.37** | **3/36 (+0.57)** |
+| 10 | 45.5 cm | 2.71× | 0.724 | 15.51% | 10.99 / 11.25 | 9/36 (+4.39) |
+| 20 | 84.4 cm | 3.94× | 0.639 | 21.11% | 8.61 / 8.47 | 7/36 (+7.38) |
+
+What holds:
+
+- **`window = 1` is an exact control.** One scan, so the pose cannot matter, and all three
+  maps agree (IoU 0.997, identical permitted speed). A discrepancy there would be a
+  transform bug rather than a finding.
+- **Global drift is the wrong statistic.** VO ends 12.06 m off (3.55%), but a fused map only
+  ever composes poses within its window, so what governs it is the relative error over a few
+  tenths of a second — 24 cm at five scans. Two orders of magnitude apart, and it is why the
+  VO column matches the ground-truth column up to five scans.
+- **The single-scan map was optimistic because it was blind.** It permits 16.38 m/s against
+  the five-scan map's 13.36 while missing 44% of that map's occupied cells.
+- **The knee is between 5 and 10 scans.** Frames where the VO map permits more than truth go
+  3/36 → 9/36 and the worst excursion +0.57 → +4.39 m/s.
+
+Errors are split into **phantom** (invented, costs speed, cannot crash) and **missed** (real
+geometry lost, the only kind that can hurt) rather than pooled into one similarity score.
+
+What does not hold / is not separated:
+
+- **Dynamic actors are a confound.** Moving traffic smears into trails, and with ground-truth
+  poses that is indistinguishable here from revealed static geometry. Free-space carving is
+  the standard fix and is not implemented, so "1.86× the scene mapped" is an upper bound on
+  the *useful* gain.
+- **Far-field excursions are a grid-boundary artefact.** The largest optimistic cases are
+  obstacles near `x_max = 50 m` that drift moves across the edge into assumed-free space.
+
+A bug this surfaced, worth its own line: accumulation initially cut permitted speed from
+25.1 m/s to **2.2 m/s** with perfect poses, because the roof-mounted Velodyne sees its own
+car and fusion supplies the road surface underneath those returns that makes them measure
+0.81 m tall. Ego self-filtering fixes it and costs zero occupancy cells on a single scan.
+
 ## Reproduce
 
 ```bash
+# accumulated mapping (the table above; --audit-ego re-derives the self-filter box)
+python3 scripts/eval_mapping.py --sweep 1 2 3 5 10 20 --every 12 --max-speed 21
+python3 scripts/eval_mapping.py --audit-ego
+
 python3 scripts/train_ppo.py --steps 600000 --out models/ppo_raw
 python3 scripts/train_ppo.py --steps 600000 --shield --out models/ppo_shielded
 python3 scripts/eval_policies.py --episodes 200

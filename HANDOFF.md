@@ -1,4 +1,4 @@
-# kitti-nav — session handoff (2026-08-02)
+# kitti-nav — session handoff (2026-08-02, second session)
 
 Plain-English "pick up here." The README is the polished public account; this is the working
 notes — what was decided and why, what broke, and what is actually left.
@@ -25,19 +25,62 @@ The seed idea was `gsplat-rt`'s nav capstone: a hard safety shield wrapping any 
 question was whether it survives contact with *driving*. Mostly it did — but almost nothing
 ported unchanged, and one of its headline results did not reproduce (below).
 
-## Status — all merged to `main`, 5 commits, **105 tests green**
+## Status — on `main`, **137 tests green**
 
 | milestone | state | measured |
 | --- | --- | --- |
 | Bicycle (Ackermann) model + braking shield | done | — |
 | KITTI raw loading (stereo + lidar + OXTS) | done | drive 0009: 447 frames, 332.8 m, ≤11.4 m/s |
 | Stereo VO (ORB + PnP) | done | **3.55% drift** over 332.8 m, 26.4 fps CPU |
-| Lidar → BEV occupancy + distance field | done | **1.8% occupied, 1.9 ms/frame** |
+| Lidar → BEV occupancy + distance field | done | **4.3% occupied, 2.1 ms/frame** |
 | Shield on real lidar | done | **6 ms/frame**; binds on 3/443 frames |
 | Learned planner (PPO) behind the shield | done | **78% success, 0 collisions** on real KITTI |
 | Shield-in-the-loop, 5-seed replication | done | **negative result** (see below) |
+| **VO poses + lidar fused into an accumulated map** | **done this session** | **1.86× the scene mapped at 5 scans** |
 
 Full numbers: `README.md` and `scripts/RESULTS.md`.
+
+## This session (2026-08-02): the VO↔BEV gap is closed
+
+The "biggest architectural hole" the previous handoff named is fixed. `src/kitti_nav/mapping.py`
+transforms scans through estimated poses into the current Velodyne frame and rasterises them
+together; `scripts/eval_mapping.py` measures single-scan vs GT-pose vs VO-pose maps.
+
+**Three findings worth not re-deriving:**
+
+1. **Global ATE is the wrong statistic for map fusion.** VO ends 12.06 m off (3.55%), which
+   sounds fatal, but a fused map never composes poses beyond its own window. The governing
+   number is the *relative* pose error over that window — 24 cm at 5 scans. Two orders of
+   magnitude apart, and it is why VO-pose maps match GT-pose maps almost exactly up to 5 scans
+   (permitted speed 13.37 vs 13.36 m/s).
+2. **The single-scan map was optimistic because it was blind.** It permits 16.38 m/s where the
+   5-scan map permits 13.36, while missing **44%** of that map's occupied cells. Fusion makes
+   the planner slower and better informed — do not read the speed drop as a regression.
+3. **Operating point is 5 scans.** Between 5 and 10 the unsafe direction (VO map permitting
+   more than the GT map) jumps 3/36 → 9/36 frames, worst excursion +0.57 → +4.39 m/s.
+
+**The bug it surfaced — read this before touching `bev.py`.** Accumulation first cut permitted
+speed 25.1 → **2.2 m/s**, with phantom obstacles inside the car's own footprint, *with perfect
+poses*. The roof-mounted Velodyne sees the ego car (hood, roof rails, mirrors). In a single scan
+those cells hold *only* bodywork, so the per-cell ground estimate treats the bodywork as ground
+and calls the cell free — **the single-scan map was right by accident**. Fusion supplies the road
+surface underneath from an earlier viewpoint, and the 0.81 m difference reads as an obstacle.
+Fixed by ego self-filtering (`drop_ego_returns`, box `KITTI_EGO_BOX` measured not derived, since
+the body rectangle is anchored 0.32 m off the lidar centreline while self-returns are symmetric
+about the sensor and reach 1.5 m laterally). Costs 41 returns and **zero** occupancy cells on a
+single scan, so it is on by default everywhere.
+
+Two dead ends, recorded so they are not retried: `min_support` (requiring several returns above
+ground per cell) looked like the fix but could not separate phantom from real — restoring
+single-scan parity needed a threshold that pushed occupancy *below* the single-scan baseline,
+i.e. deleting real geometry. And detecting ego returns by sensor-frame persistence needs a
+lateral bound: roadside structure persists too while the car holds its lane, and without it the
+audit returns a kerb line at y ≈ −2.3 m present in 100% of scans.
+
+**Also corrected this session:** the README's ground-removal table did not reproduce
+(claimed 1.82%/6.23% occupancy and `height_diff` as the *faster* mode; actually 2.40%/3.65% at
+frame 0 and `height_diff` is slower, 2.1 vs 1.3 ms). Corrected in place with a note. The paired
+clearance figures did reproduce. Conclusion and default are unchanged.
 
 ## Decisions already made — don't re-litigate these
 
@@ -52,8 +95,17 @@ Full numbers: `README.md` and `scripts/RESULTS.md`.
 - **Grid-native `ObstacleField`, never fitting circles to occupancy.** Circles would discard
   exactly the arbitrary shape occupancy is good at.
 - **`height_diff` (local per-cell) ground removal**, chosen by measurement over a fixed plane:
-  1.82% vs 6.23% occupied, 6.04 m vs 2.58 m clearance at 30 m. The plane mode's extra cells
-  are *road* drifting out of the band — phantom obstacles that brake the car for open road.
+  2.40% vs 3.65% occupied at frame 0 (4.33% vs 8.23% drive mean), 5.96 m vs 2.58 m clearance
+  at 30 m, and 2.1 vs 1.3 ms — it is the *slower* mode, and the extra 0.8 ms is worth it. The
+  plane mode's extra cells are *road* drifting out of the band — phantom obstacles that brake
+  the car for open road. (Figures re-measured 2026-08-02; the previous 1.82%/6.23%/"faster"
+  did not reproduce. Conclusion and default unchanged.)
+- **Point-level, not grid-level, scan fusion.** Transform point clouds and rasterise once,
+  rather than rasterising each scan and OR-ing the grids. The ground estimate *improves* with
+  more returns per cell, which is exactly `height_diff`'s weak spot; OR-ing binary grids would
+  bake each scan's ground-removal mistakes in permanently.
+- **Ego self-filtering is on by default everywhere**, including the single-scan path, where it
+  costs zero occupancy cells. See bug 6.
 - **Ray observations, not an occupancy crop** — `gsplat-rt` measured the crop as marginal.
 - **CPU for RL.** Batches are far too small to amortise GPU launches; 6191 fps unshielded.
 - **Trained policies are gitignored** — reproducible in minutes.
@@ -78,6 +130,16 @@ Full numbers: `README.md` and `scripts/RESULTS.md`.
 5. **A confidence interval that measured the wrong variance.** 600 eval episodes measure
    *scene* luck; the claim was about a *training method*, whose replicate is the training run.
    Fixed by the 5-seed sweep.
+6. **The car mapped itself as a wall.** The roof-mounted Velodyne sees its own bodywork. In a
+   single scan those cells hold *only* bodywork, so the per-cell ground estimate takes the
+   bodywork as ground and calls them free — **right by accident**. Fusion supplies the road
+   surface underneath from an earlier viewpoint, the 0.81 m difference reads as an obstacle,
+   and phantom walls appear inside the vehicle footprint: permitted speed 25.1 → **2.2 m/s**,
+   *with perfect poses*. Fixed by `mapping.drop_ego_returns`. **Lesson: a latent bug can be
+   masked by a limitation, and removing the limitation is what exposes it — the single-scan
+   map's blindness was hiding it.** Symmetrically, `min_support` (demand several returns above
+   ground per cell) *looks* like the fix and is not: separating phantom from real needs a
+   threshold that pushes occupancy below the single-scan baseline, i.e. deletes real geometry.
 
 ## The negative result (keep it honest)
 
@@ -101,11 +163,19 @@ Seed spread was small (1.0–2.9 pts), unusually low for deep RL. Sweep cost ~35
 
 ## Known gaps — read this before picking next work
 
-- **⚠ VO and BEV are not connected.** This is the biggest architectural hole. `odometry.py`
-  produces poses; `bev.py` builds a grid from a *single frozen scan*. Nothing fuses scans
-  across frames into a persistent map. Right now they are two good components that don't talk.
-- **Everything is static.** No moving actors — the single largest gap versus real AV. KITTI
-  raw has tracklet annotations for some drives.
+- **⚠ Dynamic actors are now the top gap, and fusion made it worse.** No moving actors, and
+  accumulation smears the ones in the recording into trails. With ground-truth poses that is
+  indistinguishable from revealed static geometry, so "1.86× the scene mapped" is an *upper
+  bound* on the useful gain. **Free-space carving** — ray-cast each scan and clear what it saw
+  through — is the standard fix, needs no new dependencies, and would also let the map forget
+  obstacles that have moved. KITTI raw has tracklets for some drives.
+- **No free/unknown distinction, and fusion raises the stakes.** `outside_is_free=True` was
+  defensible for one scan covering the braking envelope; an accumulated map has real interior
+  holes too. The largest optimistic (unsafe-direction) excursions measured are obstacles near
+  `x_max = 50 m` that drift pushes across the boundary into assumed-free space.
+- **The grid cannot certify above 21.2 m/s.** `sqrt(2 · 4.5 · 50)`. Any permitted speed above
+  that is `outside_is_free` talking, not the sensor — which is why `eval_mapping.py` caps at 21
+  while `render_bev.py` still uses 35. Worth reconciling.
 - **The shield never steers evasively.** It picks between the commanded steer and the held
   steer and otherwise brakes; it will brake for something it could have swerved around.
 - **The footprint disc cover is conservative** — inflates the car ~0.12 m per side and ~0.55 m
@@ -114,25 +184,31 @@ Seed spread was small (1.0–2.9 pts), unusually low for deep RL. Sweep cost ~35
 - **VO has no bundle adjustment, keyframing, or loop closure** — error accumulates
   monotonically. 3.55% is respectable, not SOTA.
 - **One drive, one hyperparameter set.**
-- **Unknown space is treated as free** (`outside_is_free=True`) — only defensible while the
-  grid covers the braking envelope; `covers_stopping_distance()` exists to assert it.
+- **The planner does not yet drive the fused map.** `mapping.py` produces it and
+  `eval_mapping.py` measures it, but `nav_env.py`'s `KittiScenes` still builds scenes from a
+  single frozen scan. Wiring it through is the obvious next step and would re-open every
+  policy number in `RESULTS.md` — the fused map is harder (more real obstacles), so expect
+  success rates to move.
 
 ## What next — options
 
-**My recommendation: (1) then (2).**
+**My recommendation: (1) then (2).** Option 1 from the previous handoff is done.
 
-1. **Fuse VO poses + lidar into an accumulated BEV map.** Closes the gap above and makes the
-   repo one coherent pipeline instead of two halves. Concretely: transform each scan into a
-   common frame using the VO trajectory, accumulate occupancy over a sliding window, and let
-   the planner drive the *accumulated* map. It also creates a real experiment — accumulated
-   maps inherit VO drift, so this measures how odometry error propagates into planning safety,
-   which is a genuinely interesting AV question and needs no new dependencies.
+1. **Free-space carving, then let the planner drive the fused map.** Ray-cast each scan to
+   mark what it saw *through* as free, so dynamic actors stop smearing into permanent walls
+   and the map gains a real free/unknown/occupied distinction instead of `outside_is_free`.
+   This is the direct unblock for both top gaps above, needs no new dependencies, and the
+   measurement harness already exists — `eval_mapping.py` would show it as the missed/phantom
+   split improving at large windows.
 2. **Dynamic obstacles.** Parse KITTI tracklets (or synthesise moving actors) and extend the
    shield to reason about a moving obstacle's reachable set rather than a static one. This is
-   where the safety argument gets properly hard — and where "AV" actually lives.
+   where the safety argument gets properly hard — and where "AV" actually lives. Carving (1)
+   first makes this much easier to evaluate.
 3. Evasive steering in the shield (search over steer candidates, not just two).
 4. Strengthen VO: local bundle adjustment or keyframing; SuperPoint+LightGlue front-end beat
-   ORB in `gsplat-rt` (3.5 cm vs 5.7 cm ATE on TUM) but is box-gated.
+   ORB in `gsplat-rt` (3.5 cm vs 5.7 cm ATE on TUM) but is box-gated. Note the mapping result
+   lowers the priority of this: fusion is governed by *within-window* relative error, which is
+   already 24 cm, not by the global drift bundle adjustment would fix.
 5. More drives / seeds to firm up generalisation claims.
 
 ## Environment / repo facts
