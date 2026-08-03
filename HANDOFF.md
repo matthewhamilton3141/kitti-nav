@@ -1,7 +1,29 @@
-# kitti-nav — session handoff (2026-08-02, second session)
+# kitti-nav — session handoff (2026-08-03)
 
 Plain-English "pick up here." The README is the polished public account; this is the working
 notes — what was decided and why, what broke, and what is actually left.
+
+## ⚠ Read first: the tree is not where you'd assume
+
+**Work is on `feat/map-fusion`, two commits, pushed, and NOT merged to `main`.**
+
+```
+feat/map-fusion  9083033  feat: let the planner drive the accumulated map
+                 db410e3  feat: fuse VO poses + lidar into an accumulated BEV map
+main             02a1098  ← still the previous session's tip
+```
+
+Working tree clean, branch in sync with `origin`. **A decision is pending and was left to the
+user:** fast-forward `main` (`git checkout main && git merge --ff-only feat/map-fusion &&
+git push`) or open the repo's first PR. Nothing else is blocked on it — just don't assume
+`main` has any of the mapping work, and don't re-do it because `git log main` looks stale.
+
+This also breaks the repo's prior convention of committing straight to `main`; the branch was
+used because the change is large. Either resolution is fine, but pick one before adding more.
+
+Separately: **`~/Documents/gsplat-rt` has an uncommitted `HANDOFF.md`** — pre-existing, from
+before this repo started, recording the "Option B chosen" decision. Not this repo's problem,
+but it will show up in `git status` there and is not a stray edit to discard.
 
 ## What this is
 
@@ -25,7 +47,7 @@ The seed idea was `gsplat-rt`'s nav capstone: a hard safety shield wrapping any 
 question was whether it survives contact with *driving*. Mostly it did — but almost nothing
 ported unchanged, and one of its headline results did not reproduce (below).
 
-## Status — on `main`, **137 tests green**
+## Status — **140 tests green** (on `feat/map-fusion`; `main` is at 105)
 
 | milestone | state | measured |
 | --- | --- | --- |
@@ -36,12 +58,12 @@ ported unchanged, and one of its headline results did not reproduce (below).
 | Shield on real lidar | done | **6 ms/frame**; binds on 3/443 frames |
 | Learned planner (PPO) behind the shield | done | **78% success, 0 collisions** on real KITTI |
 | Shield-in-the-loop, 5-seed replication | done | **negative result** (see below) |
-| **VO poses + lidar fused into an accumulated map** | **done this session** | **1.86× the scene mapped at 5 scans** |
-| **Planner driving the fused map** | **done this session** | **shield still 0 collisions; success −12 to −14 pts** |
+| **VO poses + lidar fused into an accumulated map** | done — *on the branch* | **1.86× the scene mapped at 5 scans** |
+| **Planner driving the fused map** | done — *on the branch* | **shield still 0 collisions; success −12 to −14 pts** |
 
 Full numbers: `README.md` and `scripts/RESULTS.md`.
 
-## This session (2026-08-02): the VO↔BEV gap is closed
+## Last session: the VO↔BEV gap is closed (branch `feat/map-fusion`)
 
 The "biggest architectural hole" the previous handoff named is fixed. `src/kitti_nav/mapping.py`
 transforms scans through estimated poses into the current Velodyne frame and rasterises them
@@ -104,7 +126,7 @@ against. On fused maps in-loop training leads +2 pts (64 vs 62), same small same
 as single-scan (+3) — corroboration, not evidence; the seed sweep has **not** been re-run on
 fused maps (~35 min if wanted).
 
-**Also corrected this session:** the README's ground-removal table did not reproduce
+**Also corrected on that branch:** the README's ground-removal table did not reproduce
 (claimed 1.82%/6.23% occupancy and `height_diff` as the *faster* mode; actually 2.40%/3.65% at
 frame 0 and `height_diff` is slower, 2.1 vs 1.3 ms). Corrected in place with a note. The paired
 clearance figures did reproduce. Conclusion and default are unchanged.
@@ -251,4 +273,26 @@ Seed spread was small (1.0–2.9 pts), unusually low for deep RL. Sweep cost ~35
 - Attribution is policy, not decoration: `ATTRIBUTION.md` lists every upstream with license;
   adapted files carry provenance headers saying what changed and why. **KITTI is
   non-commercial**; pykitti/sb3/gymnasium are MIT, OpenCV Apache-2.0, torch BSD-3.
-- Workflow so far: direct commits to `main` (solo repo, no PRs yet).
+- Workflow: was direct commits to `main` (solo repo, no PRs). The mapping work broke that and
+  sits on `feat/map-fusion` — see the top of this file; resolve before adding more.
+- The VO trajectory is cached at `data/cache/vo_poses_*.npz` (gitignored, ~17 s to rebuild).
+  `eval_mapping.py --refresh-vo` forces a rebuild.
+- Numbers in the docs are re-measured, not inherited. Two claims were corrected downward this
+  way (the ground-removal table, and gsplat-rt's shield-in-the-loop win). If a figure here
+  disagrees with what you measure, **trust your measurement and correct the doc.**
+
+## Commands worth knowing
+
+```bash
+python3 -m pytest tests/ -q                     # 140 green; dataset tests skip without KITTI
+
+# mapping: the sweep behind the accumulated-map table, and the ego self-filter audit
+python3 scripts/eval_mapping.py --sweep 1 2 3 5 10 20 --every 12 --max-speed 21
+python3 scripts/eval_mapping.py --audit-ego
+
+# policies: prints synthetic + KITTI single-scan + KITTI fused, all three
+python3 scripts/eval_policies.py --episodes 200
+
+python3 scripts/eval_odometry.py --plot docs/trajectory.png
+python3 scripts/render_bev.py --frame 294 --speed-profile docs/speed_profile.png
+```
