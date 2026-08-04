@@ -24,8 +24,9 @@ Runs entirely on a laptop — pure NumPy + OpenCV, no GPU, no simulator install.
 | Learned planner behind the shield | done — **78% success, 0 collisions on real KITTI** |
 | VO poses + lidar fused into an accumulated map | done — **1.9× the scene mapped at 5 scans** |
 | Planner driving the accumulated map | done — **still 0 collisions shielded, on harder geometry** |
+| Free-space carving + occupied/free/unknown map | done — **sound (unit-tested), off by default; honest non-result on this static drive** |
 
-**105 tests pass.** Dataset-backed tests skip cleanly when KITTI isn't downloaded; the
+**148 tests pass.** Dataset-backed tests skip cleanly when KITTI isn't downloaded; the
 environment core is pure NumPy and tests without any RL stack installed.
 
 ## Quickstart
@@ -309,7 +310,12 @@ in 100% of scans.
 - **Dynamic actors are a confound.** Some of the occupancy accumulation adds is moving
   traffic smeared into trails, not revealed static geometry, and with GT poses the two are
   not separable here. Free-space carving (ray-casting each scan to clear what it saw through)
-  is the standard fix and is not implemented.
+  is the standard fix and is now implemented — height-aware, so a beam over a car's roof can't
+  erase the car, with an occupied/free/unknown tri-state replacing `outside_is_free`. It is
+  sound (unit-tested) but off by default: on this largely-static drive it does not measurably
+  recover the gap through the map-vs-GT metric, because carving both maps makes the benefit
+  cancel and there is little moving traffic to forget. Details and numbers in
+  [`scripts/RESULTS.md`](scripts/RESULTS.md).
 - **The far field runs out of grid.** The largest optimistic excursions are obstacles near
   `x_max = 50 m` that drift moves across the boundary, where `outside_is_free=True` reads
   them as clear. This is also why the sweep caps speed at 21 m/s: `sqrt(2 · 4.5 · 50)` is the

@@ -1,4 +1,4 @@
-# kitti-nav — session handoff (2026-08-03)
+# kitti-nav — session handoff (2026-08-04)
 
 Plain-English "pick up here." The README is the polished public account; this is the working
 notes — what was decided and why, what broke, and what is actually left.
@@ -47,7 +47,7 @@ The seed idea was `gsplat-rt`'s nav capstone: a hard safety shield wrapping any 
 question was whether it survives contact with *driving*. Mostly it did — but almost nothing
 ported unchanged, and one of its headline results did not reproduce (below).
 
-## Status — **140 tests green** (on `feat/map-fusion`; `main` is at 105)
+## Status — **148 tests green** (on `feat/map-fusion`; `main` is at 105)
 
 | milestone | state | measured |
 | --- | --- | --- |
@@ -60,8 +60,52 @@ ported unchanged, and one of its headline results did not reproduce (below).
 | Shield-in-the-loop, 5-seed replication | done | **negative result** (see below) |
 | **VO poses + lidar fused into an accumulated map** | done — *on the branch* | **1.86× the scene mapped at 5 scans** |
 | **Planner driving the fused map** | done — *on the branch* | **shield still 0 collisions; success −12 to −14 pts** |
+| **Free-space carving + occupied/free/unknown map** | done — *on the branch* | **sound (unit-tested); non-result on this static drive (below)** |
 
 Full numbers: `README.md` and `scripts/RESULTS.md`.
+
+## This session: free-space carving — built, sound, and an honest non-result
+
+Option 1 from the previous handoff is done. Carving (`mapping.fuse_map` with `carve=True`, or
+`ScanAccumulator` streaming) ray-casts each scan and retires an occupied cell a later scan saw
+*through*; `BEVGrid` now carries an occupied / free /
+**unknown** tri-state (`mapping.FusedMap`) instead of only `outside_is_free`. `carve` is off by
+default and the un-carved path reproduces the old occupancy bit-for-bit (there is a test).
+
+**Read this before spending more time on carving — the real-data result is a non-result, on
+purpose, and re-deriving it wastes a day.**
+
+- **It is height-aware (2.5D), and that is the whole point.** A beam clears a cell only where
+  it crossed the near-ground band `[ground, ground+0.25]`, so a beam flying *over* a car to a
+  wall behind it cannot erase the car. The one failure class that can crash (a lost real
+  obstacle) is what the height gate exists to prevent. `test_carving_spares_an_obstacle_a_beam_passes_over`
+  is the test the design exists to pass; a flat 2D carve fails it.
+- **The evidence rule is `misses > carve_persistence * hits`** (log-odds-ish, occupied-biased),
+  counted once per scan. A static wall (hit every scan) is never retired in a short window; a
+  moving actor (hit once, driven past) is. Default `carve_persistence = 2`.
+- **On drive 0009 it does NOT improve the map-vs-GT metric — at any persistence.** Missed and
+  phantom tick *up* slightly at every window (w5: missed 10.10→10.52%). Two structural reasons,
+  both real: (1) the eval carves *both* the GT and VO maps (a GT map smears actors into trails
+  too, so carving only VO would score de-smeared cells as dangerous "missed"), so the benefit
+  is symmetric and **cancels** in a VO-vs-GT comparison; (2) the drive is largely static, so
+  there is little dynamic smear to forget. Occupancy agreement cannot separate a correctly
+  forgotten actor from lost geometry without per-actor labels — so it cannot credit carving.
+- **What carving *does* do is remove cells, growing with the window** (−0.2% at 2 scans to −11%
+  at 20), and **at large windows it is a liability**: by 20 scans the worst optimistic excursion
+  jumps +7.38 → **+21.00 m/s** (a real obstacle blurred by 84 cm of drift, carved away, read as
+  clearance near the grid edge). At the operating point (5 scans) it is safe and nearly inert
+  (unsafe direction unchanged, 3/36 @ +0.57). Keep carving to short windows.
+- **The dead end, so it is not retried:** tuning `carve_persistence` (swept 2/4/8) does not find
+  a value that both de-smears and keeps missed flat — higher just makes carving more inert. The
+  payoff is not demonstrable through `eval_mapping` on a static drive. Where it *would* show is
+  a drive with traffic, or the planner itself — a policy on a carved map (deferred, below).
+
+Scope was deliberately held here: the shield and RL rays still read `occupancy` alone, so the
+`unknown` mask changes no existing number yet. Wiring honest "unknown blocks" semantics into
+`distance_to_obstacles`/`ray_distances` and re-running `eval_policies.py --fused-window` is the
+follow-up that would actually measure whether carving wins back some of the 12–14 lost points.
+
+Reproduce: `python3 scripts/eval_mapping.py --sweep 1 2 3 5 10 20 --every 12 --max-speed 21 --carve`.
 
 ## Last session: the VO↔BEV gap is closed (branch `feat/map-fusion`)
 
@@ -212,16 +256,21 @@ Seed spread was small (1.0–2.9 pts), unusually low for deep RL. Sweep cost ~35
 
 ## Known gaps — read this before picking next work
 
-- **⚠ Dynamic actors are now the top gap, and fusion made it worse.** No moving actors, and
-  accumulation smears the ones in the recording into trails. With ground-truth poses that is
+- **⚠ Dynamic actors remain the top gap; carving is built but unproven on this drive.**
+  Accumulation smears the recording's moving actors into trails; with GT poses that is
   indistinguishable from revealed static geometry, so "1.86× the scene mapped" is an *upper
-  bound* on the useful gain. **Free-space carving** — ray-cast each scan and clear what it saw
-  through — is the standard fix, needs no new dependencies, and would also let the map forget
-  obstacles that have moved. KITTI raw has tracklets for some drives.
-- **No free/unknown distinction, and fusion raises the stakes.** `outside_is_free=True` was
-  defensible for one scan covering the braking envelope; an accumulated map has real interior
-  holes too. The largest optimistic (unsafe-direction) excursions measured are obstacles near
-  `x_max = 50 m` that drift pushes across the boundary into assumed-free space.
+  bound* on the useful gain. **Free-space carving is now implemented** (see "This session")
+  and would let the map forget an obstacle that moved — but drive 0009 is too static to show
+  it, and `eval_mapping` cannot credit it (the benefit cancels when both maps are carved). The
+  open work is measuring it where it can pay off: the planner, or a drive with real traffic.
+  KITTI raw has tracklets for some drives.
+- **No free/unknown distinction *in the consumers* — carving added the mask, not the
+  semantics.** `BEVGrid` now carries an `unknown` mask, but the shield and RL rays still read
+  `occupancy` alone, so `outside_is_free=True` is still the operative assumption. The largest
+  optimistic (unsafe-direction) excursions are still obstacles near `x_max = 50 m` that drift
+  pushes across the boundary into assumed-free space — and carving *worsens* them at large
+  windows (+21 m/s at 20 scans). Wiring "unknown blocks" into `distance_to_obstacles`/
+  `ray_distances` is the deferred half of the carving work.
 - **The grid cannot certify above 21.2 m/s.** `sqrt(2 · 4.5 · 50)`. Any permitted speed above
   that is `outside_is_free` talking, not the sensor — which is why `eval_mapping.py` caps at 21
   while `render_bev.py` still uses 35. Worth reconciling.
@@ -241,19 +290,21 @@ Seed spread was small (1.0–2.9 pts), unusually low for deep RL. Sweep cost ~35
 
 ## What next — options
 
-**My recommendation: (1) then (2).** Option 1 from the previous handoff is done.
+**My recommendation: (1) then (2).** Free-space carving (last handoff's option 1) is done, but
+it landed as a non-result on this drive (above) — so the two things that would actually pay it
+off both move to the top.
 
-1. **Free-space carving.** Ray-cast each scan to mark what it saw *through* as free, so
-   dynamic actors stop smearing into permanent walls and the map gains a real
-   free/unknown/occupied distinction instead of `outside_is_free`. Direct unblock for both top
-   gaps above, no new dependencies, and both measurement harnesses already exist:
-   `eval_mapping.py` would show it as the missed/phantom split improving at large windows, and
-   `eval_policies.py --fused-window` would show whether it wins back some of the 12–14 points
-   fusion cost (some of that cost is smeared traffic, i.e. obstacles that are not really there).
+1. **Carving where it can be measured: the planner, or a drive with traffic.** `eval_mapping`
+   provably cannot credit carving on a static drive (the benefit cancels, no per-actor labels).
+   Two ways to fix that, in order of effort: (a) wire honest "unknown blocks" semantics into
+   `distance_to_obstacles`/`ray_distances` and re-run `eval_policies.py --fused-window` on a
+   carved map — the deferred half of this session's plan, and the direct test of the 12–14-point
+   question; (b) evaluate on a KITTI drive with real moving traffic (0009 is too static), where
+   the de-smear the unit tests prove would show up in the missed/phantom split.
 2. **Dynamic obstacles.** Parse KITTI tracklets (or synthesise moving actors) and extend the
    shield to reason about a moving obstacle's reachable set rather than a static one. This is
-   where the safety argument gets properly hard — and where "AV" actually lives. Carving (1)
-   first makes this much easier to evaluate.
+   where the safety argument gets properly hard — and where "AV" actually lives. Carving is the
+   representation that makes this tractable (it can forget an obstacle that moved).
 3. Evasive steering in the shield (search over steer candidates, not just two).
 4. Strengthen VO: local bundle adjustment or keyframing; SuperPoint+LightGlue front-end beat
    ORB in `gsplat-rt` (3.5 cm vs 5.7 cm ATE on TUM) but is box-gated. Note the mapping result
@@ -284,11 +335,15 @@ Seed spread was small (1.0–2.9 pts), unusually low for deep RL. Sweep cost ~35
 ## Commands worth knowing
 
 ```bash
-python3 -m pytest tests/ -q                     # 140 green; dataset tests skip without KITTI
+python3 -m pytest tests/ -q                     # 148 green; dataset tests skip without KITTI
 
 # mapping: the sweep behind the accumulated-map table, and the ego self-filter audit
 python3 scripts/eval_mapping.py --sweep 1 2 3 5 10 20 --every 12 --max-speed 21
 python3 scripts/eval_mapping.py --audit-ego
+
+# free-space carving: the carved comparison (--carve), plus the carve_persistence sweep
+python3 scripts/eval_mapping.py --sweep 1 2 3 5 10 20 --every 12 --max-speed 21 --carve
+python3 scripts/eval_mapping.py --sweep 5 10 20 --every 12 --carve --carve-persistence 4
 
 # policies: prints synthetic + KITTI single-scan + KITTI fused, all three
 python3 scripts/eval_policies.py --episodes 200

@@ -24,9 +24,11 @@ from kitti_nav.bev import BEVConfig, BEVGrid, occupancy_from_scan
 from kitti_nav.kitti import DEFAULT_DATA_DIR, KittiDrive, invert_se3
 from kitti_nav.mapping import (
     KITTI_EGO_BOX,
+    FusedMap,
     MapConfig,
     ScanAccumulator,
     drop_ego_returns,
+    fuse_map,
     fuse_scans,
     occupancy_agreement,
     relative_lidar_transform,
@@ -355,6 +357,158 @@ def test_occupancy_agreement_is_perfect_on_identical_grids():
 def test_occupancy_agreement_rejects_mismatched_shapes():
     with pytest.raises(ValueError):
         occupancy_agreement(np.zeros((4, 4)), np.zeros((5, 5)))
+
+
+# --- free-space carving --------------------------------------------------------------------
+#
+# Carving ray-casts each scan and retires occupied cells a later scan saw *through*, so a
+# moving actor stops smearing into a permanent wall and never-observed holes read as unknown
+# rather than free. The one claim that has teeth is the safety one: carving must never remove
+# a real obstacle, so a beam that flies *over* a car to something behind it must not clear the
+# car. These scenes are analytic (occlusion where it matters is modelled by which returns a
+# viewpoint is given), so the counts mean something.
+
+
+def _cell(cfg, x, y):
+    """Grid (row, col) of a world point — for asserting about a specific place on the map."""
+    return (int((x - cfg.x_min) / cfg.resolution), int((y - cfg.y_min) / cfg.resolution))
+
+
+def test_carve_off_reproduces_the_uncarved_fused_map():
+    """The reproducibility control: with carving off, nothing about the old map changes."""
+    world = np.concatenate([road(), wall(22.0, -4.0, 4.0)])
+    rigs = [se3(x=0.5 * i) for i in range(5)]
+    scans = [observe(world, r) for r in rigs]
+    poses = [cam_pose(r) for r in rigs]
+
+    fm = fuse_map(scans, poses, T_CAM_VELO, cfg=MapConfig(carve=False))
+    expected = occupancy_from_scan(fuse_scans(scans, poses, T_CAM_VELO))
+    assert np.array_equal(fm.occupied, expected)
+    assert fm.unknown is None                            # the old binary map draws no unknown
+
+
+def test_carving_retires_a_moving_actors_trail():
+    """A car seen once, then driven past, must not stay mapped where it used to be.
+
+    Scan 0 sees an obstacle at x=12; the next four scans see only open road there, so their
+    beams pass through that cell near the ground. One occupied observation against four
+    see-through observations is retired, and the cell becomes free rather than a phantom wall.
+    """
+    scans, poses = [], []
+    for i, d in enumerate([0.0, 0.5, 1.0, 1.5, 2.0]):
+        rig = se3(x=d)
+        w = road(seed=i)
+        if i == 0:
+            w = np.concatenate([w, wall(12.0, -0.6, 0.6, n=60, height=1.5)])
+        scans.append(observe(w, rig))
+        poses.append(cam_pose(rig))
+
+    uncarved = fuse_map(scans, poses, T_CAM_VELO, cfg=MapConfig(carve=False))
+    carved = fuse_map(scans, poses, T_CAM_VELO, cfg=MapConfig(carve=True))
+
+    # The actor is at world x=12; the last viewpoint (x=2) puts it at x=10 in the ref frame.
+    r, c = _cell(carved.cfg, 10.0, 0.0)
+    before = int(uncarved.occupied[r - 2:r + 3, c - 4:c + 5].sum())
+    after = int(carved.occupied[r - 2:r + 3, c - 4:c + 5].sum())
+    assert before >= 4, f"actor should smear without carving, got {before} cells"
+    assert after < before / 2, f"carving barely touched the trail: {before} -> {after}"
+    assert carved.free[r - 2:r + 3, c - 4:c + 5].any()
+
+
+def test_carving_spares_an_obstacle_a_beam_passes_over():
+    """The safety test the whole 2.5D design exists to pass — no carved 'missed' cell.
+
+    A car stands at x=15; a taller wall stands at x=30 with clear road only up to the car
+    (nothing between them is visible, as the car occludes it). Beams to the wall therefore
+    fly *over* the car's roof. A flat 2D carve would clear the car's column on the way to the
+    wall; the height gate must not, because the beam was never down in the obstacle band there.
+    """
+    scans, poses = [], []
+    for d in (0.0, 0.5, 1.0):
+        rig = se3(x=d)
+        w = np.concatenate([road(x=(-10, 13)),                # road only in front of the car
+                            wall(15.0, -0.6, 0.6, n=60, height=1.5),
+                            wall(30.0, -3.0, 3.0, n=300, height=2.4)])
+        scans.append(observe(w, rig))
+        poses.append(cam_pose(rig))
+
+    uncarved = fuse_map(scans, poses, T_CAM_VELO, cfg=MapConfig(carve=False))
+    carved = fuse_map(scans, poses, T_CAM_VELO, cfg=MapConfig(carve=True))
+
+    cfg = carved.cfg
+    r0, c = _cell(cfg, 13.5, 0.0)
+    r1, _ = _cell(cfg, 15.6, 0.0)
+    before = int(uncarved.occupied[r0:r1, c - 4:c + 5].sum())
+    after = int(carved.occupied[r0:r1, c - 4:c + 5].sum())
+    assert before > 0
+    assert after == before, f"a beam over the roof carved the car: {before} -> {after}"
+
+    # ...and carving was genuinely active — the road ahead of the car is now observed-free.
+    rf, cf = _cell(cfg, 6.0, 0.0)
+    assert carved.free[rf, cf]
+
+
+def test_carving_keeps_a_wall_seen_from_every_viewpoint():
+    """A static wall is hit by every scan, so no amount of see-through evidence retires it.
+
+    Road only in front of the wall, since a real wall occludes whatever is behind it — a scene
+    with returns behind a solid wall would be casting beams the sensor could never send.
+    """
+    world = np.concatenate([road(x=(-10, 19)), wall(20.0, -5.0, 5.0)])
+    rigs = [se3(x=0.4 * i) for i in range(5)]
+    scans = [observe(world, r) for r in rigs]
+    poses = [cam_pose(r) for r in rigs]
+
+    uncarved = fuse_map(scans, poses, T_CAM_VELO, cfg=MapConfig(carve=False))
+    carved = fuse_map(scans, poses, T_CAM_VELO, cfg=MapConfig(carve=True))
+    # The wall may thin at its very edges, but its core must survive essentially intact.
+    assert carved.occupied.sum() >= 0.9 * uncarved.occupied.sum()
+
+
+def test_carving_only_ever_removes_occupied_cells():
+    """The invariant that makes carving safe by construction: it never invents an obstacle."""
+    world = np.concatenate([road(), wall(18.0, -4.0, 4.0)])
+    rigs = [se3(x=0.5 * i, z=0.03 * i) for i in range(5)]   # a little drift, some phantoms
+    scans = [observe(world, r) for r in rigs]
+    poses = [cam_pose(r) for r in rigs]
+
+    uncarved = fuse_map(scans, poses, T_CAM_VELO, cfg=MapConfig(carve=False))
+    carved = fuse_map(scans, poses, T_CAM_VELO, cfg=MapConfig(carve=True))
+    assert (carved.occupied <= uncarved.occupied).all()
+
+
+def test_carving_marks_never_seen_cells_unknown_not_free():
+    """The free/unknown distinction: a cell no beam reached is unknown, not assumed clear."""
+    world = np.concatenate([road(), wall(20.0, -4.0, 4.0)])
+    rigs = [se3(x=0.4 * i) for i in range(4)]
+    scans = [observe(world, r) for r in rigs]
+    poses = [cam_pose(r) for r in rigs]
+
+    carved = fuse_map(scans, poses, T_CAM_VELO, cfg=MapConfig(carve=True))
+    cfg = carved.cfg
+    # A far corner off to the side that no forward-facing beam ever swept.
+    r, c = _cell(cfg, -9.0, 18.0)
+    assert carved.unknown[r, c] and not carved.free[r, c] and not carved.occupied[r, c]
+    # The three classes partition the grid exactly.
+    assert (carved.occupied.astype(bool) | carved.free | carved.unknown).all()
+    assert not (carved.free & carved.unknown).any()
+
+
+def test_carving_flows_through_the_accumulator_grid():
+    """The live streaming path honours the carve flag and carries the unknown mask onward."""
+    world = np.concatenate([road(), wall(18.0, -6.0, 6.0)])
+    acc = ScanAccumulator(T_CAM_VELO, MapConfig(window=4, carve=True))
+    for d in (0.0, 0.6, 1.2, 1.8):
+        acc.add(observe(world, se3(x=d)), cam_pose(se3(x=d)))
+
+    grid = acc.grid()
+    assert grid.unknown is not None and grid.unknown.any()
+    assert grid.occupancy.sum() > 0                      # the wall is still there
+
+
+def test_carve_persistence_must_be_positive():
+    with pytest.raises(ValueError):
+        MapConfig(carve_persistence=0.0)
 
 
 def test_fuse_scans_rejects_mismatched_scan_and_pose_counts():

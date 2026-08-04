@@ -188,12 +188,23 @@ class BEVGrid:
     """
 
     def __init__(self, occupancy: np.ndarray, cfg: BEVConfig | None = None,
-                 outside_is_free: bool = True):
+                 outside_is_free: bool = True, unknown: np.ndarray | None = None):
         self.cfg = cfg or BEVConfig()
         self.occupancy = np.asarray(occupancy, np.uint8)
         self.outside_is_free = outside_is_free
         if self.occupancy.shape != self.cfg.shape:
             raise ValueError(f"grid {self.occupancy.shape} != config shape {self.cfg.shape}")
+
+        # Optional third occupancy class: cells no lidar ray ever passed through, as opposed
+        # to cells observed and found clear. `None` (the default) is the binary map every
+        # existing consumer sees — occupied vs "everything else is free". Free-space carving
+        # (`mapping.fuse_map` with carving on) fills this in; it is carried here for measurement and
+        # rendering only. The shield and the RL rays still read `occupancy` alone this pass,
+        # so an un-consumed `unknown` mask cannot change any existing number — folding it into
+        # `distance_field`/`ray_distances` is a deliberate later step.
+        self.unknown = None if unknown is None else np.asarray(unknown, bool)
+        if self.unknown is not None and self.unknown.shape != self.cfg.shape:
+            raise ValueError(f"unknown {self.unknown.shape} != config shape {self.cfg.shape}")
 
     @classmethod
     def from_scan(cls, points: np.ndarray, cfg: BEVConfig | None = None,

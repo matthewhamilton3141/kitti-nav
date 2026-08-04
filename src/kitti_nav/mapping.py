@@ -50,7 +50,14 @@ from typing import Deque, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .bev import BEVConfig, BEVGrid
+from .bev import (
+    KITTI_LIDAR_HEIGHT,
+    BEVConfig,
+    BEVGrid,
+    _in_bounds_cells,
+    estimate_ground_z,
+    occupancy_from_scan,
+)
 from .kitti import invert_se3
 
 
@@ -185,11 +192,38 @@ class MapConfig:
     # not optional for a fused map — see `drop_ego_returns`. `None` disables it.
     ego_box: Optional[Tuple[float, float, float, float]] = KITTI_EGO_BOX
 
+    # --- free-space carving (off by default) ----------------------------------------------
+    # Ray-cast each scan and retire occupied cells a later scan saw *through*, so a moving
+    # actor stops smearing its earlier positions into a permanent wall, and never-observed
+    # interior holes read as `unknown` rather than free. Off by default so every un-carved
+    # number reproduces bit-for-bit; see `_carve_evidence` and `fuse_map`.
+    carve: bool = False
+
+    # How stubborn an occupied cell is: the number of see-through observations (from distinct
+    # scans) needed to overturn one occupied observation. A cell is carved to free only when
+    # `misses > carve_persistence * hits`, so a single stray beam through a real wall's gap
+    # cannot erase it, while several later scans clearing a vacated cell can. At the default a
+    # cell seen once as occupied survives until it is seen through more than twice: a static
+    # wall (hit every scan) is never retired inside a short window, while a moving actor
+    # (hit once, then driven past) is. Higher values carve less and are safer under heavy
+    # drift; lower values de-smear more aggressively. `scripts/eval_mapping.py --carve` sweeps
+    # it — on the largely-static drive 0009 no value makes carving a net win on the map-vs-GT
+    # metric (see RESULTS.md), so this is a conservative default for a feature that is off
+    # unless `carve` is set, and whose payoff is on drives with real traffic.
+    carve_persistence: float = 2.0
+
+    # Only carve within this range (m) of a scan's own sensor. Far returns are sparse and the
+    # least accurate part of a scan, so the free evidence they cast is the least trustworthy;
+    # bounding the march also bounds its cost. `None` carves to the grid edge.
+    carve_max_range: Optional[float] = 40.0
+
     def __post_init__(self) -> None:
         if self.window < 1:
             raise ValueError(f"window must be >= 1, got {self.window}")
         if self.stride < 1:
             raise ValueError(f"stride must be >= 1, got {self.stride}")
+        if self.carve_persistence <= 0:
+            raise ValueError(f"carve_persistence must be > 0, got {self.carve_persistence}")
 
 
 class ScanAccumulator:
@@ -279,9 +313,34 @@ class ScanAccumulator:
                     pts, relative_lidar_transform(ref, pose, self.T_cam_velo)))
         return np.concatenate(out, axis=0)
 
+    def fused_map(self, pose_ref: Optional[np.ndarray] = None) -> FusedMap:
+        """The carved tri-state map over the current window, in `pose_ref`'s Velodyne frame.
+
+        Mirrors `fused_points` but keeps each scan separate so its beams can be ray-cast, and
+        transforms the sensor origins alongside the points. With carving off this is just the
+        fused occupancy wrapped in a `FusedMap`.
+        """
+        ref = self.latest_pose if pose_ref is None else np.asarray(pose_ref, float)
+        pts_per_scan, origins = [], []
+        for pts, pose in self._scans:
+            if np.array_equal(pose, ref):
+                pts_per_scan.append(pts)
+                origins.append(np.zeros(3, np.float32))       # ref sensor is at the origin
+            else:
+                T = relative_lidar_transform(ref, pose, self.T_cam_velo)
+                pts_per_scan.append(transform_points(pts, T))
+                origins.append(T[:3, 3].astype(np.float32))
+        return _assemble_map(pts_per_scan, origins, self.cfg, self.bev_cfg)
+
     def grid(self, pose_ref: Optional[np.ndarray] = None,
              outside_is_free: bool = True) -> BEVGrid:
-        """Fused occupancy + distance field, ready for the shield. See `fused_points`."""
+        """Fused occupancy + distance field, ready for the shield. See `fused_points`.
+
+        When `cfg.carve` is off this is the un-carved fused occupancy, unchanged. When it is
+        on the grid is carved and carries an `unknown` mask (`fused_map`).
+        """
+        if self.cfg.carve:
+            return self.fused_map(pose_ref).to_bev_grid(outside_is_free)
         return BEVGrid.from_scan(self.fused_points(pose_ref), self.bev_cfg,
                                  outside_is_free=outside_is_free)
 
@@ -308,6 +367,187 @@ def fuse_scans(scans: Sequence[np.ndarray], poses: Sequence[np.ndarray],
                             relative_lidar_transform(pose_ref, pose, T_cam_velo))
            for pts, pose in zip(scans, poses)]
     return np.concatenate(out, axis=0)
+
+
+# Hard ceiling on samples marched per beam. The near-ground miss band is thin, so a beam is
+# in it for a short run; this only bites on the shallowest (near-horizontal, long-range)
+# beams, which are also the least accurate. Bounding it keeps a pathological scan from
+# blowing up memory without changing the carve on normal geometry.
+_CARVE_MAX_SAMPLES_PER_BEAM = 256
+
+
+def _beam_miss_cells(pts_ref: np.ndarray, origin: np.ndarray, z_lo: float, z_hi: float,
+                     bev_cfg: BEVConfig, cfg: MapConfig) -> np.ndarray:
+    """Flat cell indices a scan's beams passed *through* within the near-ground miss band.
+
+    A beam from `origin` to a return certifies a cell clear only where it crossed the band
+    `[z_lo, z_hi] = [ground, ground + min_height]`: a real obstacle rises from the ground, so
+    anything reaching `min_height` would have blocked a beam passing that low. Above the band
+    the beam may have flown *over* an obstacle (the far-wall-over-near-car case), so those
+    cells get no free evidence — that height gate is the whole point of carving in 2.5D
+    rather than flat 2D.
+
+    Each beam is clipped analytically to the `t`-range where its height is inside the band
+    and it is still short of its own return (the endpoint cell is where the beam *stopped*,
+    not free space), then sampled at half-cell steps so no crossed cell is skipped. Returns
+    indices with duplicates; the caller dedupes so one scan counts as one observation.
+    """
+    o = np.asarray(origin, float)
+    d = np.asarray(pts_ref, float)[:, :3] - o                  # beam vectors, (N, 3)
+    horiz_len = np.hypot(d[:, 0], d[:, 1])
+    step = bev_cfg.resolution * 0.5
+
+    keep = horiz_len > step
+    if cfg.carve_max_range is not None:
+        keep &= horiz_len <= cfg.carve_max_range
+    d, horiz_len = d[keep], horiz_len[keep]
+    if len(d) == 0:
+        return np.empty(0, np.int64)
+
+    # z(t) = o_z + t * dz is linear, so the band is a single [t_lo, t_hi] interval.
+    dz = d[:, 2]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ta = (z_lo - o[2]) / dz
+        tb = (z_hi - o[2]) / dz
+    t_lo = np.minimum(ta, tb)
+    t_hi = np.maximum(ta, tb)
+    # A (near-)horizontal beam never crosses the band; it is inside it for its whole length
+    # iff the sensor itself sits in the band, which it does not (it is ~1.7 m up). Force such
+    # beams out rather than dividing by ~0.
+    flat = np.abs(dz) < 1e-9
+    t_lo = np.where(flat, 1.0, t_lo)
+    t_hi = np.where(flat, 0.0, t_hi)
+
+    # Stop one step short of the return so its own cell is never marked free.
+    t_end = np.clip(1.0 - step / np.maximum(horiz_len, step), 0.0, 1.0)
+    t_lo = np.clip(t_lo, 0.0, 1.0)
+    t_hi = np.minimum(np.clip(t_hi, 0.0, 1.0), t_end)
+
+    seg_len = (t_hi - t_lo) * horiz_len                        # in-band horizontal run (m)
+    good = seg_len > 0.0
+    if not good.any():
+        return np.empty(0, np.int64)
+    d, horiz_len = d[good], horiz_len[good]
+    t_lo, t_hi = t_lo[good], t_hi[good]
+
+    n = np.clip(np.ceil(seg_len[good] / step).astype(np.int64), 1,
+                _CARVE_MAX_SAMPLES_PER_BEAM)
+    beam = np.repeat(np.arange(len(n)), n)                     # which beam each sample is on
+    within = np.arange(len(beam)) - np.repeat(np.cumsum(n) - n, n)   # 0..n_j-1 per beam
+    frac = (within + 0.5) / n[beam]                           # cell-centre sampling
+    t = t_lo[beam] + (t_hi[beam] - t_lo[beam]) * frac
+
+    xy = o[:2] + d[beam, :2] * t[:, None]
+    _, idx = _in_bounds_cells(xy, bev_cfg)                    # cols 0,1 are x,y — as needed
+    return idx
+
+
+def _carve_evidence(pts_per_scan: Sequence[np.ndarray], origins: Sequence[np.ndarray],
+                    ground_z: float, bev_cfg: BEVConfig, cfg: MapConfig
+                    ) -> Tuple[np.ndarray, np.ndarray]:
+    """Per-cell counts of hits and see-through misses across a window, each `(rows, cols)`.
+
+    `hits` counts scans that placed a return in the cell within the obstacle band; `misses`
+    counts scans whose beams passed through it in the near-ground band. Both are counted at
+    most once per scan, so the comparison `misses > persistence * hits` weighs *observations*
+    (how many viewpoints agreed), not raw return density, which would let one dense near scan
+    outvote several distant ones.
+    """
+    rows, cols = bev_cfg.shape
+    hits = np.zeros(rows * cols, np.int64)
+    misses = np.zeros(rows * cols, np.int64)
+
+    band_lo = ground_z + bev_cfg.min_height          # obstacle band: a real hit lives here
+    band_hi = ground_z + bev_cfg.max_height
+    miss_lo, miss_hi = ground_z, band_lo             # near-ground band: a beam clears here
+
+    for pts, origin in zip(pts_per_scan, origins):
+        if len(pts) == 0:
+            continue
+        in_band = (pts[:, 2] >= band_lo) & (pts[:, 2] <= band_hi)
+        if in_band.any():
+            _, hit_idx = _in_bounds_cells(pts[in_band], bev_cfg)
+            hits[np.unique(hit_idx)] += 1
+        miss_idx = _beam_miss_cells(pts, origin, miss_lo, miss_hi, bev_cfg, cfg)
+        if len(miss_idx):
+            misses[np.unique(miss_idx)] += 1
+
+    return hits.reshape(rows, cols), misses.reshape(rows, cols)
+
+
+@dataclass
+class FusedMap:
+    """A carved occupancy grid split into the three classes carving can now distinguish.
+
+    ``occupied`` is the un-carved fused occupancy with cells a later scan saw through removed;
+    ``free`` and ``unknown`` partition the rest into observed-clear versus never-observed.
+    ``unknown`` is ``None`` when carving was off, marking the map as the old binary one where
+    the distinction was never drawn.
+    """
+
+    occupied: np.ndarray                     # (rows, cols) uint8, 1 = occupied
+    free: np.ndarray                         # (rows, cols) bool
+    unknown: Optional[np.ndarray]            # (rows, cols) bool, or None if un-carved
+    cfg: BEVConfig
+
+    def to_bev_grid(self, outside_is_free: bool = True) -> BEVGrid:
+        """The `BEVGrid` the planner consumes, carrying the `unknown` mask for measurement."""
+        return BEVGrid(self.occupied, self.cfg, outside_is_free=outside_is_free,
+                       unknown=self.unknown)
+
+
+def _assemble_map(pts_per_scan: Sequence[np.ndarray], origins: Sequence[np.ndarray],
+                  cfg: MapConfig, bev_cfg: BEVConfig) -> FusedMap:
+    """Rasterise the fused cloud, then (if enabled) carve it — the shared core of both paths.
+
+    The un-carved occupancy is exactly `occupancy_from_scan` of the concatenated points, so
+    `carve=False` returns the map every earlier caller already got. Carving only ever *removes*
+    occupied cells (those a later scan contradicted) and labels the untouched holes; it never
+    invents an occupied cell, so it cannot manufacture a missed obstacle.
+    """
+    rows, cols = bev_cfg.shape
+    fused = (np.concatenate(list(pts_per_scan), axis=0) if len(pts_per_scan)
+             else np.zeros((0, 3), np.float32))
+    occ = occupancy_from_scan(fused, bev_cfg)
+
+    if not cfg.carve:
+        return FusedMap(occ, np.zeros((rows, cols), bool), None, bev_cfg)
+
+    ground_z = estimate_ground_z(fused) if len(fused) else -KITTI_LIDAR_HEIGHT
+    hits, misses = _carve_evidence(pts_per_scan, origins, ground_z, bev_cfg, cfg)
+
+    carved = occ.copy()
+    retire = (occ > 0) & (misses > cfg.carve_persistence * hits)
+    carved[retire] = 0
+
+    touched = (hits > 0) | (misses > 0)
+    free = (carved == 0) & touched
+    unknown = (carved == 0) & ~touched
+    return FusedMap(carved, free, unknown, bev_cfg)
+
+
+def fuse_map(scans: Sequence[np.ndarray], poses: Sequence[np.ndarray],
+             T_cam_velo: np.ndarray, ref: int = -1, cfg: Optional[MapConfig] = None,
+             bev_cfg: Optional[BEVConfig] = None) -> FusedMap:
+    """One-shot fused + optionally carved map from exactly these scans, in `scans[ref]`'s frame.
+
+    The tri-state counterpart to `fuse_scans`: same frames in, but it keeps each scan's
+    points and sensor origin separate so it can ray-cast them, and returns the carved
+    `FusedMap` rather than a bare point cloud. With `cfg.carve` off its `occupied` grid equals
+    `occupancy_from_scan(fuse_scans(...))` exactly.
+    """
+    cfg = cfg or MapConfig()
+    bev_cfg = bev_cfg or BEVConfig()
+    if len(scans) != len(poses):
+        raise ValueError(f"{len(scans)} scans but {len(poses)} poses")
+
+    pose_ref = np.asarray(poses[ref], float)
+    pts_per_scan, origins = [], []
+    for pts, pose in zip(scans, poses):
+        T = relative_lidar_transform(pose_ref, np.asarray(pose, float), T_cam_velo)
+        pts_per_scan.append(transform_points(drop_ego_returns(pts, cfg.ego_box), T))
+        origins.append(T[:3, 3].astype(np.float32))           # sensor origin -> ref frame
+    return _assemble_map(pts_per_scan, origins, cfg, bev_cfg)
 
 
 def window_indices(ref: int, cfg: MapConfig, n_available: int) -> list[int]:

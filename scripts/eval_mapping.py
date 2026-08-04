@@ -36,7 +36,9 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -47,6 +49,7 @@ from kitti_nav.kitti import KittiDrive                              # noqa: E402
 from kitti_nav.mapping import (                                     # noqa: E402
     MapConfig,
     drop_ego_returns,
+    fuse_map,
     fuse_scans,
     occupancy_agreement,
     window_indices,
@@ -169,12 +172,19 @@ def scan_loader(drive: KittiDrive, maxsize: int):
 
 def evaluate(drive: KittiDrive, gt: np.ndarray, vo: np.ndarray, mcfgs: list[MapConfig],
              bcfg: BEVConfig, vcfg: VehicleConfig, frames: np.ndarray,
-             verbose: bool = True) -> list[dict]:
+             verbose: bool = True, carve: bool = False,
+             carve_persistence: Optional[float] = None) -> list[dict]:
     """Compare the three maps over `frames`, for every window config; one pass over the data.
 
     Frames are the **outer** loop and window sizes the inner one, so every scan a frame
     needs is read once and reused across all the windows that overlap it. The reverse
     nesting reloads the whole drive per window size.
+
+    With `carve`, a fourth and fifth map are built: the gt and vo maps with free-space carving
+    on. Both are carved, not just vo, on purpose — a gt-pose map smears a moving actor into a
+    trail exactly as a vo map does, so carving only vo and scoring it against an un-carved gt
+    would book every correctly de-smeared cell as a dangerous *missed* one. Carving both keeps
+    the reference honest, so `missed` still means "real geometry vo lost to drift".
     """
     rows: dict[int, list] = {i: [] for i in range(len(mcfgs))}
     load = scan_loader(drive, maxsize=max(m.window * m.stride for m in mcfgs) + 4)
@@ -202,7 +212,7 @@ def evaluate(drive: KittiDrive, gt: np.ndarray, vo: np.ndarray, mcfgs: list[MapC
             agree_vo = occupancy_agreement(grids["vo"].occupancy, grids["gt"].occupancy)
             agree_single = occupancy_agreement(single.occupancy, grids["gt"].occupancy)
 
-            rows[j].append({
+            row = {
                 "frame": ref,
                 "n_scans": len(idx),
                 "occ_single": int(single.occupancy.sum()),
@@ -215,13 +225,42 @@ def evaluate(drive: KittiDrive, gt: np.ndarray, vo: np.ndarray, mcfgs: list[MapC
                 "v_single": v_single,
                 "v_gt": max_safe_speed(grids["gt"], vcfg, state=state),
                 "v_vo": max_safe_speed(grids["vo"], vcfg, state=state),
-            })
+            }
+
+            if carve:
+                ccfg = replace(mcfg, carve=True)
+                if carve_persistence is not None:
+                    ccfg = replace(ccfg, carve_persistence=carve_persistence)
+                t0 = time.perf_counter()
+                carved = {name: fuse_map(scans, [poses[i] for i in idx],
+                                         drive.T_cam2_velo, ref=-1, cfg=ccfg, bev_cfg=bcfg)
+                          for name, poses in (("gt", gt), ("vo", vo))}
+                carve_ms = (time.perf_counter() - t0) * 1000.0
+                cg = {name: BEVGrid(fm.occupied, bcfg) for name, fm in carved.items()}
+                agree_carved = occupancy_agreement(cg["vo"].occupancy, cg["gt"].occupancy)
+                row.update({
+                    "carve_ms": carve_ms,
+                    "occ_gt_carved": int(cg["gt"].occupancy.sum()),
+                    "occ_vo_carved": int(cg["vo"].occupancy.sum()),
+                    "iou_carved": agree_carved["iou"],
+                    "phantom_rate_carved": agree_carved["phantom_rate"],
+                    "missed_rate_carved": agree_carved["missed_rate"],
+                    "v_gt_carved": max_safe_speed(cg["gt"], vcfg, state=state),
+                    "v_vo_carved": max_safe_speed(cg["vo"], vcfg, state=state),
+                })
+
+            rows[j].append(row)
             if verbose:
                 r = rows[j][-1]
-                print(f"  frame {r['frame']:4d}  cells {r['occ_single']:5d}->"
-                      f"{r['occ_vo']:5d}  IoU {r['iou']:.3f}  "
-                      f"missed {r['missed_rate']:6.2%}  permitted "
-                      f"{r['v_single']:5.2f}/{r['v_gt']:5.2f}/{r['v_vo']:5.2f} m/s")
+                line = (f"  frame {r['frame']:4d}  cells {r['occ_single']:5d}->"
+                        f"{r['occ_vo']:5d}  IoU {r['iou']:.3f}  "
+                        f"missed {r['missed_rate']:6.2%}  permitted "
+                        f"{r['v_single']:5.2f}/{r['v_gt']:5.2f}/{r['v_vo']:5.2f} m/s")
+                if carve:
+                    line += (f"  | carved occ {r['occ_vo_carved']:5d}  "
+                             f"missed {r['missed_rate_carved']:6.2%}  "
+                             f"phantom {r['phantom_rate_carved']:6.2%}")
+                print(line)
 
     return [aggregate(rows[j], m,
                       relative_pose_error(vo, gt, m.window * m.stride))
@@ -238,7 +277,7 @@ def aggregate(rows: list[dict], mcfg: MapConfig, rpe: float) -> dict:
     # resolution (0.05 m/s), so numerical noise is not counted as an unsafe reading.
     optimistic = v_vo > v_gt + 0.05
 
-    return {
+    out = {
         "window": mcfg.window,
         "stride": mcfg.stride,
         "n_frames": len(rows),
@@ -260,6 +299,24 @@ def aggregate(rows: list[dict], mcfg: MapConfig, rpe: float) -> dict:
         "rows": rows,
     }
 
+    if rows and "phantom_rate_carved" in rows[0]:
+        v_gt_c, v_vo_c = col("v_gt_carved"), col("v_vo_carved")
+        optimistic_c = v_vo_c > v_gt_c + 0.05
+        out.update({
+            "carve_ms": float(np.mean(col("carve_ms"))),
+            "occ_gt_carved": float(np.mean(col("occ_gt_carved"))),
+            "occ_vo_carved": float(np.mean(col("occ_vo_carved"))),
+            "iou_carved": float(np.mean(col("iou_carved"))),
+            "phantom_rate_carved": float(np.mean(col("phantom_rate_carved"))),
+            "missed_rate_carved": float(np.mean(col("missed_rate_carved"))),
+            "v_gt_carved": float(np.mean(v_gt_c)),
+            "v_vo_carved": float(np.mean(v_vo_c)),
+            "n_optimistic_carved": int(optimistic_c.sum()),
+            "max_optimistic_carved": float(np.max(v_vo_c - v_gt_c)) if len(rows) else 0.0,
+        })
+
+    return out
+
 
 def report(res: dict) -> None:
     print()
@@ -279,6 +336,20 @@ def report(res: dict) -> None:
           f"{res['n_optimistic']}/{res['n_frames']} frames "
           f"(worst {res['max_optimistic']:+.2f} m/s)")
 
+    if "phantom_rate_carved" in res:
+        print(f"  --- with free-space carving ({res['carve_ms']:.1f} ms/frame) ---")
+        print(f"  occupied cells (carved)  gt {res['occ_gt_carved']:7.0f}   "
+              f"vo {res['occ_vo_carved']:7.0f}   "
+              f"(vs un-carved gt {res['occ_gt']:.0f} / vo {res['occ_vo']:.0f})")
+        print(f"  vo vs gt map (carved)    IoU {res['iou_carved']:.3f}   "
+              f"phantom {res['phantom_rate_carved']:.2%}   "
+              f"missed {res['missed_rate_carved']:.2%}")
+        print(f"    phantom {res['phantom_rate']:.2%} -> {res['phantom_rate_carved']:.2%}   "
+              f"missed {res['missed_rate']:.2%} -> {res['missed_rate_carved']:.2%}   "
+              f"(carving must not raise missed)")
+        print(f"  UNSAFE direction (carved): {res['n_optimistic_carved']}/{res['n_frames']} "
+              f"frames (worst {res['max_optimistic_carved']:+.2f} m/s)")
+
 
 def plot_sweep(results: list[dict], out: Path) -> None:
     """Coverage, map fidelity, and the safety gap, all against window size."""
@@ -289,9 +360,14 @@ def plot_sweep(results: list[dict], out: Path) -> None:
     w = [r["window"] for r in results]
     fig, axes = plt.subplots(1, 4, figsize=(20, 4.6))
 
+    carved = "occ_vo_carved" in results[0]
+
     axes[0].plot(w, [r["occ_gt"] for r in results], "o-", label="ground-truth poses")
     axes[0].plot(w, [r["occ_vo"] for r in results], "s-", label="stereo VO poses")
     axes[0].axhline(results[0]["occ_single"], color="k", ls="--", label="single scan")
+    if carved:
+        axes[0].plot(w, [r["occ_vo_carved"] for r in results], "s:", color="tab:green",
+                     label="VO + carving")
     axes[0].set_ylabel("occupied cells")
     axes[0].set_title("Fusion maps several times more of the scene")
 
@@ -299,6 +375,11 @@ def plot_sweep(results: list[dict], out: Path) -> None:
                  color="tab:orange", label="phantom (costs speed)")
     axes[1].plot(w, [100 * r["missed_rate"] for r in results], "s-",
                  color="tab:red", label="missed (dangerous)")
+    if carved:
+        axes[1].plot(w, [100 * r["phantom_rate_carved"] for r in results], "o:",
+                     color="tab:orange", alpha=0.6, label="phantom + carving")
+        axes[1].plot(w, [100 * r["missed_rate_carved"] for r in results], "s:",
+                     color="tab:red", alpha=0.6, label="missed + carving")
     axes[1].set_ylabel("% of true occupied cells")
     axes[1].set_title("VO drift corrupts the map, asymmetrically")
 
@@ -355,6 +436,11 @@ def main() -> int:
                    help="raise the speed cap so geometry, not the cap, is what binds")
     p.add_argument("--plot", type=Path, default=None, help="write the sweep figure here")
     p.add_argument("--refresh-vo", action="store_true", help="ignore the cached VO poses")
+    p.add_argument("--carve", action="store_true",
+                   help="also build carved (free-space) maps and report the phantom/missed "
+                        "split against un-carved; gt and vo are both carved (see evaluate)")
+    p.add_argument("--carve-persistence", type=float, default=None,
+                   help="override MapConfig.carve_persistence for the carved maps")
     p.add_argument("--audit-ego", action="store_true",
                    help="re-derive the ego self-return box from the data and exit")
     args = p.parse_args()
@@ -382,7 +468,8 @@ def main() -> int:
 
     mcfgs = [MapConfig(window=w, stride=args.stride) for w in windows]
     results = evaluate(drive, gt, vo, mcfgs, bcfg, vcfg, frames,
-                       verbose=len(windows) == 1)
+                       verbose=len(windows) == 1, carve=args.carve,
+                       carve_persistence=args.carve_persistence)
     for res in results:
         report(res)
 

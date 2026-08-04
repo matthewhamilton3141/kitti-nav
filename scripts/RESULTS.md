@@ -187,9 +187,10 @@ geometry lost, the only kind that can hurt) rather than pooled into one similari
 What does not hold / is not separated:
 
 - **Dynamic actors are a confound.** Moving traffic smears into trails, and with ground-truth
-  poses that is indistinguishable here from revealed static geometry. Free-space carving is
-  the standard fix and is not implemented, so "1.86× the scene mapped" is an upper bound on
-  the *useful* gain.
+  poses that is indistinguishable here from revealed static geometry, so "1.86× the scene
+  mapped" is an upper bound on the *useful* gain. Free-space carving — the standard fix — is
+  now implemented (next section); on this static drive it does not measurably recover the gap,
+  and why is itself a result.
 - **Far-field excursions are a grid-boundary artefact.** The largest optimistic cases are
   obstacles near `x_max = 50 m` that drift moves across the edge into assumed-free space.
 
@@ -198,12 +199,83 @@ A bug this surfaced, worth its own line: accumulation initially cut permitted sp
 car and fusion supplies the road surface underneath those returns that makes them measure
 0.81 m tall. Ego self-filtering fixes it and costs zero occupancy cells on a single scan.
 
+## Free-space carving — implemented, sound, and an honest non-result on this drive
+
+The confound above — moving traffic smeared into permanent walls — now has its standard fix in
+the code. Carving (`mapping.fuse_map` with `carve=True`, or `ScanAccumulator` streaming)
+ray-casts each scan and retires an occupied cell a later scan saw *through*, and the map gains
+an occupied / free / **unknown** tri-state in place of the
+single `outside_is_free` flag. It is **height-aware (2.5D)**: a beam clears a cell only where
+it crossed the near-ground band `[ground, ground + 0.25 m]`, so a beam that flew *over* a car
+on its way to a wall behind it cannot erase the car — the one error class (a lost real
+obstacle) that can cause a collision. Carving is **off by default**; every other number in
+this file is un-carved.
+
+Soundness is pinned by unit tests where ground truth is exact (`tests/test_mapping.py`): a
+moving actor's trail is retired, an obstacle a beam passes over is kept, a static wall
+survives every viewpoint, and a never-observed cell reads `unknown` rather than free.
+
+On real drive 0009 the measurement carves **both** the GT-pose and VO-pose maps on purpose: a
+GT map smears a moving actor into a trail exactly as a VO map does, so carving only VO and
+scoring it against an un-carved GT would book every correctly de-smeared cell as a dangerous
+*missed* one. Carving both keeps the reference honest — `missed` still means "real geometry VO
+lost to drift". 36 frames, speed cap 21 m/s, `carve_persistence = 2`.
+
+| scans | occupied cells, VO (un-carved → carved) | missed vs GT (un → carved) | worst optimistic excursion |
+| ---: | ---: | ---: | ---: |
+| 2 | 3401 → 3394 (−0.2%) | 5.14% → 5.15% | +0.21 → +0.21 |
+| 3 | 3982 → 3909 (−1.8%) | 6.96% → 7.21% | +0.21 → +0.21 |
+| **5** | **4934 → 4802 (−2.7%)** | **10.10% → 10.52%** | **+0.57 → +0.57** |
+| 10 | 7189 → 6700 (−6.8%) | 15.51% → 16.24% | +4.39 → +5.00 |
+| 20 | 10471 → 9335 (−10.8%) | 21.11% → 22.88% | +7.38 → **+21.00** |
+
+Read this honestly:
+
+- **Carving removes cells, growing with the window** (−0.2% at 2 scans to −11% at 20) —
+  consistent with clearing accumulated smear and drift phantoms.
+- **But it does not improve the map-vs-GT numbers.** Missed and phantom both tick *up* slightly
+  at every window. This is structural, not a bug: carving is applied to both maps, so any
+  de-smearing cancels in a VO-vs-GT comparison, leaving only carving's own drift noise. Without
+  per-actor labels, occupancy agreement cannot separate a correctly forgotten actor from lost
+  geometry, so it cannot credit the thing carving exists to do.
+- **At the operating point (5 scans) it is safe and nearly inert** — the unsafe direction is
+  unchanged (3/36 frames, worst +0.57 m/s) and missed moves 0.42 pts. Drive 0009 is largely
+  static, so there is little to forget and carving correctly does little.
+- **At large windows it is a liability.** By 20 scans the worst optimistic excursion jumps
+  +7.38 → +21.00 m/s: under 84 cm of window drift, carving removes a real (blurred) obstacle,
+  and near the grid boundary that reads as full-speed clearance. This is the "smeared free
+  space" failure mode from the module docstring, amplified — reason to keep carving to short
+  windows and a conservative `carve_persistence`.
+
+`carve_persistence` (see-throughs needed to retire one occupied observation) is the one knob,
+and sweeping it does **not** find a value that both de-smears and keeps missed flat — it only
+trades one against the other:
+
+| persistence | w5 missed Δ | w10 missed Δ | w5 cells removed |
+| ---: | ---: | ---: | ---: |
+| 2 (default) | +0.42 pts | +0.73 pts | 132 (−2.7%) |
+| 4 | +0.16 pts | +0.37 pts | 55 (−1.1%) |
+| 8 | +0.01 pts | +0.25 pts | 11 (−0.2%) |
+
+The verdict: carving is implemented and sound, but its payoff is **not demonstrable on a
+static drive through the map-fidelity metric** — and knowing *why* (the benefit is symmetric,
+so it cancels; the drive is too static to have much to forget) is the finding. Where it should
+show is a drive with real traffic, or the planner itself: a policy driving a carved map is the
+deferred next measurement. Cost is ~40–350 ms per map (2 to 20 scans), dominated by the march.
+
+![carved-map sweep](../docs/mapping_carved.png)
+
 ## Reproduce
 
 ```bash
 # accumulated mapping (the table above; --audit-ego re-derives the self-filter box)
 python3 scripts/eval_mapping.py --sweep 1 2 3 5 10 20 --every 12 --max-speed 21
 python3 scripts/eval_mapping.py --audit-ego
+
+# free-space carving: the carved comparison and the persistence sweep
+python3 scripts/eval_mapping.py --sweep 1 2 3 5 10 20 --every 12 --max-speed 21 --carve \
+  --plot docs/mapping_carved.png
+python3 scripts/eval_mapping.py --sweep 5 10 20 --every 12 --carve --carve-persistence 4
 
 python3 scripts/train_ppo.py --steps 600000 --out models/ppo_raw
 python3 scripts/train_ppo.py --steps 600000 --shield --out models/ppo_shielded
