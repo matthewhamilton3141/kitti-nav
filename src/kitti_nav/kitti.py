@@ -55,6 +55,85 @@ def invert_se3(T: np.ndarray) -> np.ndarray:
     return out
 
 
+@dataclass(frozen=True)
+class Tracklet:
+    """One KITTI-labelled object across the frames it is visible in.
+
+    Poses are in the **velodyne frame** — the same frame the BEV grid is built in — so a box
+    drops straight into occupancy with no transform. `l`/`w`/`h` are length (along the object's
+    own x), width (y), height (z); `yaw` (the pose's `rz`) rotates the footprint in the ground
+    plane. The per-frame arrays are aligned so index `k` is frame `first_frame + k`; KITTI
+    tracklets are contiguous over their visible span, so there are no gaps to reason about.
+    """
+
+    object_type: str
+    l: float
+    w: float
+    h: float
+    first_frame: int
+    tx: np.ndarray                 # (T,) per-frame centre translation in the velodyne frame
+    ty: np.ndarray
+    tz: np.ndarray
+    yaw: np.ndarray                # (T,) rz, footprint heading in the velo ground plane
+    state: np.ndarray             # (T,) KITTI pose state (0 unset, 1 interpolated, 2 labelled)
+
+    @property
+    def frames(self) -> np.ndarray:
+        return self.first_frame + np.arange(len(self.tx))
+
+    @property
+    def last_frame(self) -> int:
+        return self.first_frame + len(self.tx) - 1
+
+    def index_of(self, frame: int) -> Optional[int]:
+        """Position of `frame` within this tracklet's span, or None if it is not present."""
+        k = frame - self.first_frame
+        return int(k) if 0 <= k < len(self.tx) else None
+
+    def box_at(self, frame: int) -> Optional[np.ndarray]:
+        """Ground-plane box `(cx, cy, yaw, l, w)` in the velo frame at `frame`, or None."""
+        k = self.index_of(frame)
+        if k is None:
+            return None
+        return np.array([self.tx[k], self.ty[k], self.yaw[k], self.l, self.w], float)
+
+
+def _parse_tracklets(xml_path: Path) -> list["Tracklet"]:
+    """Parse a KITTI `tracklet_labels.xml` into `Tracklet`s, poses left in the velo frame.
+
+    The file is a boost-serialisation dump; we read only the geometry (`objectType`, `h/w/l`,
+    `first_frame`, and the per-frame `tx/ty/tz/rz` + `state`), ignoring occlusion/truncation
+    bookkeeping. A stdlib ElementTree parse keeps this dependency-free.
+    """
+    import xml.etree.ElementTree as ET
+
+    root = ET.parse(xml_path).getroot()
+    container = root.find(".//tracklets")
+    if container is None:
+        return []
+
+    def _f(node: "ET.Element", tag: str) -> float:
+        return float(node.find(tag).text)
+
+    out: list[Tracklet] = []
+    for tr in container.findall("item"):
+        if tr.find("objectType") is None:
+            continue                                   # not a tracklet entry
+        poses = tr.find("poses")
+        items = poses.findall("item") if poses is not None else []
+        if not items:
+            continue
+        cols = {k: np.array([_f(it, k) for it in items], float)
+                for k in ("tx", "ty", "tz", "rz")}
+        state = np.array([_f(it, "state") for it in items], float)
+        out.append(Tracklet(
+            object_type=tr.find("objectType").text,
+            l=_f(tr, "l"), w=_f(tr, "w"), h=_f(tr, "h"),
+            first_frame=int(_f(tr, "first_frame")),
+            tx=cols["tx"], ty=cols["ty"], tz=cols["tz"], yaw=cols["rz"], state=state))
+    return out
+
+
 class KittiDrive:
     """One KITTI raw drive: stereo imagery, calibration, lidar, and ground-truth poses."""
 
@@ -187,3 +266,61 @@ class KittiDrive:
         for i in range(len(self)):
             left, right = self.gray_pair(i)
             yield i, left, right
+
+    # -- object tracklets ----------------------------------------------------------------
+
+    @property
+    def tracklet_path(self) -> Path:
+        return (self.base_dir / self.date / f"{self.date}_drive_{self.drive}_sync"
+                / "tracklet_labels.xml")
+
+    @cached_property
+    def tracklets(self) -> list[Tracklet]:
+        """Hand-labelled objects for this drive, in the velodyne frame.
+
+        Raises if the labels are absent — they ship separately from the drive itself; see
+        `scripts/fetch_kitti.py --tracklets`. Not every drive has them, but 0009 does (98
+        objects, 12 of which genuinely move in world coordinates).
+        """
+        if not self.tracklet_path.exists():
+            raise FileNotFoundError(
+                f"no tracklet labels at {self.tracklet_path}. "
+                f"Run: python3 scripts/fetch_kitti.py --date {self.date} "
+                f"--drive {self.drive} --tracklets")
+        return _parse_tracklets(self.tracklet_path)
+
+    def tracklet_boxes(self, i: int) -> list[tuple[Tracklet, np.ndarray]]:
+        """`(tracklet, box)` for every object present at frame `i`; box is `box_at`'s array."""
+        return [(t, t.box_at(i)) for t in self.tracklets if t.index_of(i) is not None]
+
+    def tracklet_world_track(self, t: Tracklet) -> np.ndarray:
+        """Object centres in world coordinates, `(T, 3)`, using the drive's ground-truth poses.
+
+        Velo -> world is `gt_poses[frame] @ T_cam2_velo @ centre`. Frames past the pose count
+        (KITTI can label slightly beyond the OXTS stream) are dropped, so the result may be
+        shorter than the tracklet's span.
+        """
+        Tcv = self.T_cam2_velo
+        poses = self.gt_poses
+        pts = []
+        for k, fr in enumerate(t.frames):
+            if fr >= len(poses):
+                break
+            c = np.array([t.tx[k], t.ty[k], t.tz[k], 1.0])
+            pts.append((poses[fr] @ Tcv @ c)[:3])
+        return np.asarray(pts, float)
+
+    def is_moving(self, t: Tracklet, min_disp: float = 2.0) -> bool:
+        """Whether `t` actually translates in the world, vs a parked object the ego drives past.
+
+        Judged by net world displacement over the tracklet's span — a parked car's velo-frame
+        pose sweeps backward as the ego passes, but its world centre barely moves.
+        """
+        track = self.tracklet_world_track(t)
+        if len(track) < 2:
+            return False
+        return bool(np.linalg.norm(track[-1] - track[0]) > min_disp)
+
+    def moving_tracklets(self, min_disp: float = 2.0) -> list[Tracklet]:
+        """The genuinely-moving subset of `tracklets` (world displacement over `min_disp` m)."""
+        return [t for t in self.tracklets if self.is_moving(t, min_disp)]

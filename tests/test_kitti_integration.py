@@ -305,3 +305,42 @@ def test_the_shield_still_admits_no_collision_on_a_fused_map(drive):
 
     assert stats["collisions"] == 0
     assert stats["success_rate"] > 0.2, "the fused scenes should still be solvable"
+
+
+# --- object tracklets (labels ship separately from the drive) ------------------------------
+
+_HAS_TRACKLETS = (DEFAULT_DATA_DIR / "2011_09_26" / "2011_09_26_drive_0009_sync"
+                  / "tracklet_labels.xml").exists()
+needs_tracklets = pytest.mark.skipif(
+    not _HAS_TRACKLETS, reason="tracklets absent; run fetch_kitti.py --tracklets")
+
+
+@needs_tracklets
+def test_tracklets_load_in_the_velodyne_frame(drive):
+    """0009 ships 98 labelled objects; a present box sits inside the BEV grid, in velo coords."""
+    ts = drive.tracklets
+    assert len(ts) == 98
+    assert {t.object_type for t in ts} >= {"Car", "Pedestrian"}
+
+    bcfg = BEVConfig()
+    seen = 0
+    for i in range(30):
+        for t, box in drive.tracklet_boxes(i):
+            assert t.index_of(i) is not None                  # only present objects returned
+            cx, cy = box[0], box[1]
+            if bcfg.x_min < cx < bcfg.x_max and bcfg.y_min < cy < bcfg.y_max:
+                seen += 1
+    assert seen > 0, "no labelled object fell inside the grid in the first 30 frames"
+
+
+@needs_tracklets
+def test_moving_actors_are_distinguished_from_parked_ones():
+    """The world-displacement test: a full 0009 has a dozen genuine movers among 98 objects."""
+    full = KittiDrive("2011_09_26", "0009")               # full pose stream, not the 40-frame fixture
+    movers = full.moving_tracklets(min_disp=2.0)
+    assert 8 <= len(movers) <= 20                          # measured 12; loose regression guard
+    assert len(movers) < len(full.tracklets)              # most objects are parked
+    # A mover's world track really translates; the classifier agrees with its own threshold.
+    t = max(movers, key=lambda t: len(t.tx))
+    track = full.tracklet_world_track(t)
+    assert np.linalg.norm(track[-1] - track[0]) > 2.0

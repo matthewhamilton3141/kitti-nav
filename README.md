@@ -26,8 +26,9 @@ Runs entirely on a laptop — pure NumPy + OpenCV, no GPU, no simulator install.
 | Planner driving the accumulated map | done — **still 0 collisions shielded, on harder geometry** |
 | Free-space carving + occupied/free/unknown map | done — **carving wins back ~4 of ~12 lost points; shield still 0 collisions, even on a fully-honest map** |
 | Cautious speed cap on unknown space | done — **honest map drivable: 4% → ~37% success, shield still 0 collisions** |
+| Object tracklets crediting carving | done — **0009 has 12 real movers; carving retires 9% of trail, keeps 96% of the actor** |
 
-**165 tests pass.** Dataset-backed tests skip cleanly when KITTI isn't downloaded; the
+**174 tests pass.** Dataset-backed tests skip cleanly when KITTI isn't downloaded; the
 environment core is pure NumPy and tests without any RL stack installed.
 
 ## Quickstart
@@ -308,15 +309,17 @@ in 100% of scans.
 
 ### Stated honestly
 
-- **Dynamic actors are a confound.** Some of the occupancy accumulation adds is moving
-  traffic smeared into trails, not revealed static geometry, and with GT poses the two are
-  not separable here. Free-space carving (ray-casting each scan to clear what it saw through)
-  is the standard fix and is now implemented — height-aware, so a beam over a car's roof can't
-  erase the car, with an occupied/free/unknown tri-state replacing `outside_is_free`. It is
-  sound (unit-tested) and off by default. The map-vs-GT metric can't credit it (carving both
-  maps cancels the benefit; the drive is too static), but on the planner it wins back ~4 of the
-  ~12 points fusion cost the PPO policy (66% → 70%) — while the shield holds **0 collisions** on
-  every version of the map, including a fully honest occupied/free/unknown reading.
+- **Dynamic actors are a confound, and now a measured one.** Some of the occupancy accumulation
+  adds is moving traffic smeared into trails, not revealed static geometry. Free-space carving
+  (ray-casting each scan to clear what it saw through) is the standard fix and is implemented —
+  height-aware, so a beam over a car's roof can't erase the car, with an occupied/free/unknown
+  tri-state replacing `outside_is_free`. The map-vs-GT metric can't credit it (carving both maps
+  cancels the benefit), but on the planner it wins back ~4 of the ~12 points fusion cost the PPO
+  policy (66% → 70%), and — using KITTI **object tracklets** (0009 has 12 genuinely-moving
+  actors, so it is *not* too static) — carving is credited directly: it retires 9% of a moving
+  actor's trail while keeping 96% of where the actor actually is. Cranking it forgets more trail
+  but starts erasing the present actor, because the same height gate that keeps carving safe also
+  caps its forgetting. The shield holds **0 collisions** on every version of the map throughout.
   Details and numbers in [`scripts/RESULTS.md`](scripts/RESULTS.md).
 - **The honest map is unnavigable if you wall the car out of the unknown — but drivable if you
   slow it down instead.** Treating every unobserved cell as an obstacle is *sound* (the shield

@@ -392,3 +392,47 @@ class BEVGrid:
         while the braking envelope stays inside the grid. Callers should assert this.
         """
         return self.cfg.x_max >= distance
+
+
+def box_corners(box: np.ndarray) -> np.ndarray:
+    """Ground-plane corners `(4, 2)` of an oriented box `(cx, cy, yaw, l, w)`, in world metres.
+
+    `l` runs along the box's own x (its heading), `w` along y; corners go round the rectangle
+    so the result can be filled as a convex polygon.
+    """
+    cx, cy, yaw, l, w = (float(v) for v in np.asarray(box, float).reshape(5))
+    hl, hw = l / 2.0, w / 2.0
+    local = np.array([[hl, hw], [hl, -hw], [-hl, -hw], [-hl, hw]])
+    c, s = np.cos(yaw), np.sin(yaw)
+    rot = np.array([[c, -s], [s, c]])
+    return local @ rot.T + np.array([cx, cy])
+
+
+def rasterize_polygon(corners: np.ndarray, cfg: BEVConfig) -> np.ndarray:
+    """Boolean `(rows, cols)` mask filling the convex polygon of world-metre `(n, 2)` corners.
+
+    The general primitive behind `rasterize_box`; taking corners directly lets a caller fill a
+    box that has been transformed into another frame (its rectangle becomes a general quad
+    under a rigid transform with pitch/roll). A polygon entirely off the grid yields an empty
+    mask.
+    """
+    import cv2
+
+    rows, cols = cfg.shape
+    corners = np.asarray(corners, float).reshape(-1, 2)
+    r = (corners[:, 0] - cfg.x_min) / cfg.resolution
+    c = (corners[:, 1] - cfg.y_min) / cfg.resolution
+    poly = np.stack([c, r], axis=1).round().astype(np.int32)      # cv2 wants (x=col, y=row)
+    mask = np.zeros((rows, cols), np.uint8)
+    cv2.fillConvexPoly(mask, poly, 1)
+    return mask.astype(bool)
+
+
+def rasterize_box(box: np.ndarray, cfg: BEVConfig) -> np.ndarray:
+    """Boolean `(rows, cols)` footprint mask for an oriented box `(cx, cy, yaw, l, w)`.
+
+    Fills the box's ground-plane rectangle into a grid the size of `cfg`. Used to paint a
+    labelled object's footprint into the BEV — e.g. to score how well carving retires the
+    trail a moving actor leaves behind.
+    """
+    return rasterize_polygon(box_corners(box), cfg)

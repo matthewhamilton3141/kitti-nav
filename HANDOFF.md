@@ -8,7 +8,7 @@ notes — what was decided and why, what broke, and what is actually left.
 Option 1 from the previous handoff — "softer unknown semantics, so the honest map is
 drivable" — is **done, and it works**. Hard `unknown_blocks` was sound but unnavigable (4%
 success); the new **cautious speed cap** lifts that to **34–40%** while the shield stays at **0
-collisions on every shielded row**. On `feat/map-fusion`, pushed pending, **165 tests green**.
+collisions on every shielded row**. On `feat/map-fusion`, pushed, **174 tests green**.
 
 What was built, and the two decisions inside it:
 
@@ -39,6 +39,37 @@ the cap is the drivable *honest* one. Full numbers below and in `scripts/RESULTS
 
 Reproduce: `python3 scripts/eval_policies.py --episodes 200 --carve --fused-window 5` (the
 `carved+cap` column). ~15 min on the Mac.
+
+## Also this sitting: object tracklets, and carving credited (0009 is NOT too static)
+
+I added KITTI **object tracklets** and used them to credit free-space carving — the win the
+label-free `eval_mapping` metric structurally could not show. Two things fell out, one of which
+**corrects a claim in the older notes below**:
+
+- **Drive 0009 is not "too static".** It ships 98 labelled objects and **12 of them genuinely
+  move in world coordinates** (a truck 45 m, several cars 20–42 m, three pedestrians), in frames
+  ~35–120 and ~330–425. The previous handoff's "too static to show carving" was wrong — it was
+  *unmeasured*. This also means a new traffic drive is **not** needed to study dynamic actors;
+  0009 has them. (The tracklet file is tiny and downloads without re-fetching the 1.7 GB drive:
+  `fetch_kitti.py --tracklets`.)
+- **Carving's de-smear, finally credited — and its honest ceiling.** `eval_carving_credit.py`
+  paints each moving actor's labelled footprint over a window, takes the *trail* (where it was
+  minus where it is), and measures the fraction carving retires vs how much of the actor's
+  *current* footprint it wrongly erases. At the safe operating point (window 5, persistence 2)
+  carving retires **9%** of trail while keeping **96%** of the present actor; pushing it (window
+  10–15, persistence 1) lifts trail credit to 24–26% **but** drops actor-kept to 66–73% — it
+  starts erasing the real, present obstacle, the one error that can crash. **The finding: the
+  same height gate that makes carving safe (won't erase an obstacle a beam flew over) is what
+  caps its forgetting** — a vacated cell is only retired if a later beam grazed the ground there.
+  Safety and de-smear are one mechanism. Full table in `scripts/RESULTS.md`.
+
+Infra added, reusable for dynamic obstacles next: `kitti.Tracklet` + `KittiDrive.tracklets` /
+`tracklet_boxes(frame)` / `moving_tracklets()` (velo frame, world-displacement classifier), and
+`bev.rasterize_box` / `rasterize_polygon` / `box_corners`. Tracklet poses are **native to the
+velo frame**, so a box drops straight into the BEV with no transform — which is exactly what a
+dynamic-obstacle shield scenario will want.
+
+Reproduce: `python3 scripts/eval_carving_credit.py --window 5 --persistence 2`.
 
 ## ⚠ Read first: the tree is not where you'd assume
 
@@ -88,7 +119,7 @@ The seed idea was `gsplat-rt`'s nav capstone: a hard safety shield wrapping any 
 question was whether it survives contact with *driving*. Mostly it did — but almost nothing
 ported unchanged, and one of its headline results did not reproduce (below).
 
-## Status — **165 tests green** (on `feat/map-fusion`; `main` is at 105)
+## Status — **174 tests green** (on `feat/map-fusion`; `main` is at 105)
 
 | milestone | state | measured |
 | --- | --- | --- |
@@ -103,6 +134,7 @@ ported unchanged, and one of its headline results did not reproduce (below).
 | **Planner driving the fused map** | done — *on the branch* | **shield still 0 collisions; success −12 to −14 pts** |
 | **Free-space carving + occupied/free/unknown map** | done — *on the branch* | **map-metric non-result, but carving wins +4 pts on the planner; shield 0 collisions on every map (below)** |
 | **Cautious speed cap + unknown hole-closing** | done — *on the branch* | **honest map drivable: hard-block 4% → cap 34–40% success; shield still 0 collisions; corridor 10→21 m** |
+| **Object tracklets + carving credited by labels** | done — *on the branch* | **0009 has 12 real movers (not "too static"); carving retires 9% of trail keeping 96% of the present actor** |
 
 Full numbers: `README.md` and `scripts/RESULTS.md`.
 
@@ -323,14 +355,17 @@ Seed spread was small (1.0–2.9 pts), unusually low for deep RL. Sweep cost ~35
 
 ## Known gaps — read this before picking next work
 
-- **⚠ Dynamic actors remain the top gap; carving is built but unproven on this drive.**
-  Accumulation smears the recording's moving actors into trails; with GT poses that is
-  indistinguishable from revealed static geometry, so "1.86× the scene mapped" is an *upper
-  bound* on the useful gain. **Free-space carving is now implemented** (see "This session")
-  and would let the map forget an obstacle that moved — but drive 0009 is too static to show
-  it, and `eval_mapping` cannot credit it (the benefit cancels when both maps are carved). The
-  open work is measuring it where it can pay off: the planner, or a drive with real traffic.
-  KITTI raw has tracklets for some drives.
+- **⚠ Dynamic actors are still the top gap — but now measured, not assumed, and the shield
+  does not yet reason about motion.** Accumulation smears moving actors into trails; carving
+  retires some of that (**credited this sitting**: 9% of trail at the safe operating point, up
+  to 26% at settings that start erasing the present actor — see the tracklet section). The two
+  things genuinely open: (1) carving's de-smear is capped by the safety height-gate, so a
+  *dedicated* dynamic channel (use the tracklet labels, or a two-frame occupancy diff, to mark
+  and forget movers without touching static geometry) could do better than the safe-tuned carve;
+  (2) **the shield still treats every obstacle as static** — the real AV problem is reasoning
+  about a moving obstacle's *reachable set*, which the tracklet velocities now make buildable.
+  The infra is in place (`KittiDrive.moving_tracklets`, `bev.rasterize_box`). NB: the old claim
+  that 0009 is "too static" was **wrong** — it has 12 real movers.
 - **The free/unknown distinction is now drivable via the cap (resolved this session), but the
   cap is one design point, not a swept one.** `unknown_blocks` (hard) is sound but unnavigable
   (4%); the **cautious speed cap** + **hole-closing** makes it drivable (34–40%) with the shield
@@ -363,23 +398,25 @@ Seed spread was small (1.0–2.9 pts), unusually low for deep RL. Sweep cost ~35
 
 ## What next — options
 
-**My recommendation now: (2) then (3).** Carving is built, the honest map is drivable (the cap,
-this session), and the shield is sound on every map. The two things left that would actually move
-the story: measure carving where its de-smear can be *credited* (a drive with traffic), and make
-the safety argument reason about *motion*. Option 1 below is **done** — kept for the record.
+**My recommendation now: (3).** Options 1 and 2 are done — the honest map is drivable (the cap),
+and carving is credited on real movers (tracklets). 0009 turned out to *have* traffic, so no new
+drive is needed. What is left and would most move the story is making the safety argument reason
+about **motion**, for which the tracklet infra is now in place.
 
 1. **✅ DONE — softer unknown semantics, so the honest map is drivable.** The **cautious speed
-   cap** (unknown traversable, speed governed by frontier distance) plus **hole-closing** takes
-   hard-block's 4% to 34–40% with the shield still at 0 collisions. The frontier-only alternative
-   was analysed and rejected (it is a no-op for the shield — see the latest-session notes). What
-   remains is *tuning* the cap's cone/close-window (see known gaps), not designing it.
-2. **A drive with real traffic.** 0009 is too static for carving's de-smear to show in the map
-   metric or move the planner much. A drive with moving actors is where "carving forgets a car
-   that drove away" becomes a measurable win (and where dynamic obstacles, below, get real).
-3. **Dynamic obstacles.** Parse KITTI tracklets (or synthesise moving actors) and extend the
-   shield to reason about a moving obstacle's reachable set rather than a static one. This is
-   where the safety argument gets properly hard — and where "AV" actually lives. Carving is the
-   representation that makes this tractable (it can forget an obstacle that moved).
+   cap** plus **hole-closing** takes hard-block's 4% to 34–40% with the shield still at 0
+   collisions. Frontier-only was analysed and rejected (a no-op for the shield). What remains is
+   *tuning* the cap's cone/close-window (see known gaps), not designing it.
+2. **✅ DONE (differently than planned) — carving credited on real traffic.** No new drive: 0009
+   has 12 real movers, and `eval_carving_credit.py` credits carving with the object labels (9%
+   trail retired at the safe point, 96% of the present actor kept). See the tracklet section.
+3. **Dynamic obstacles — the recommended next.** The shield still treats every obstacle as
+   static. Extend it to reason about a moving obstacle's **reachable set** over the braking
+   horizon rather than a frozen footprint — this is where the safety argument gets properly hard
+   and where "AV" actually lives. Two feeds are now available for the obstacle's velocity: the
+   tracklet tracks (`moving_tracklets`, world-frame), or a label-free two-frame occupancy diff.
+   `bev.rasterize_box` paints a predicted future footprint straight into the grid the shield
+   already reads. Start with a single labelled mover from 0009's frame ~330–425 cluster.
 5. Evasive steering in the shield (search over steer candidates, not just two).
 6. Strengthen VO: local bundle adjustment or keyframing; SuperPoint+LightGlue front-end beat
    ORB in `gsplat-rt` (3.5 cm vs 5.7 cm ATE on TUM) but is box-gated. Note the mapping result
@@ -410,7 +447,11 @@ the safety argument reason about *motion*. Option 1 below is **done** — kept f
 ## Commands worth knowing
 
 ```bash
-python3 -m pytest tests/ -q                     # 165 green; dataset tests skip without KITTI
+python3 -m pytest tests/ -q                     # 174 green; dataset tests skip without KITTI
+
+# object tracklets: fetch the labels (tiny), then credit carving's de-smear on real movers
+python3 scripts/fetch_kitti.py --tracklets
+python3 scripts/eval_carving_credit.py --window 5 --persistence 2
 
 # mapping: the sweep behind the accumulated-map table, and the ego self-filter audit
 python3 scripts/eval_mapping.py --sweep 1 2 3 5 10 20 --every 12 --max-speed 21

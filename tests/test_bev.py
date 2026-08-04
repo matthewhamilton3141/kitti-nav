@@ -11,8 +11,11 @@ import pytest
 from kitti_nav.bev import (
     BEVConfig,
     BEVGrid,
+    box_corners,
     estimate_ground_z,
     occupancy_from_scan,
+    rasterize_box,
+    rasterize_polygon,
 )
 from kitti_nav.vehicle import (
     VehicleConfig,
@@ -328,6 +331,40 @@ def test_confident_clear_distance_takes_the_cone_minimum(cfg):
     ahead = grid.confident_clear_distance(np.zeros(2), 0.0, np.zeros(1), max_range=30.0)[0]
     assert ahead == 30.0                          # a straight ray misses the off-axis block
     assert float(wide.min()) < 12.0               # a wide cone reaches it and reports it
+
+
+# --- oriented-box rasterization (labelled-object footprints) --------------------------------
+
+def test_box_corners_are_the_rotated_rectangle():
+    # An axis-aligned 4 x 2 box at the origin: corners at (+-2, +-1).
+    corners = box_corners([0.0, 0.0, 0.0, 4.0, 2.0])
+    assert np.allclose(np.sort(np.abs(corners[:, 0])), [2, 2, 2, 2])
+    assert np.allclose(np.sort(np.abs(corners[:, 1])), [1, 1, 1, 1])
+    # Rotated 90 degrees, length now runs along y.
+    turned = box_corners([0.0, 0.0, np.pi / 2, 4.0, 2.0])
+    assert np.allclose(np.sort(np.abs(turned[:, 0])), [1, 1, 1, 1])
+    assert np.allclose(np.sort(np.abs(turned[:, 1])), [2, 2, 2, 2])
+
+
+def test_rasterize_box_covers_the_right_area_and_place(cfg):
+    box = np.array([10.0, 2.0, 0.0, 4.0, 2.0])          # 4 x 2 m at (10, 2)
+    mask = rasterize_box(box, cfg)
+    # Cell count is the rectangle area over the cell area, within a boundary cell or two.
+    expected = (4.0 * 2.0) / cfg.resolution ** 2
+    assert abs(mask.sum() - expected) < 4 * (4.0 + 2.0) / cfg.resolution
+    r, c = np.nonzero(mask)
+    x = cfg.x_min + r * cfg.resolution
+    y = cfg.y_min + c * cfg.resolution
+    assert 8.0 <= x.min() and x.max() <= 12.0 and 1.0 <= y.min() and y.max() <= 3.0
+
+
+def test_rasterize_box_off_grid_is_empty(cfg):
+    assert not rasterize_box([1000.0, 0.0, 0.0, 4.0, 2.0], cfg).any()
+
+
+def test_rasterize_polygon_matches_an_axis_aligned_box(cfg):
+    box = np.array([5.0, -3.0, 0.7, 4.7, 1.9])
+    assert np.array_equal(rasterize_polygon(box_corners(box), cfg), rasterize_box(box, cfg))
 
 
 def test_grid_extent_is_checked_against_the_braking_envelope(cfg):

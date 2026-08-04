@@ -265,6 +265,46 @@ scans), dominated by the march.
 
 ![carved-map sweep](../docs/mapping_carved.png)
 
+### Crediting carving with object labels — the tradeoff the fidelity metric hid
+
+The fidelity metric above had two escape hatches: it carves *both* maps (so a moving actor's
+smear cancels), and it assumed drive 0009 is too static to have much to forget. Both are now
+checkable. 0009 ships **object tracklets**, and it is **not as static as assumed** — of its 98
+labelled objects, **12 genuinely move in world coordinates** (a truck 45 m, several cars
+20–42 m, three pedestrians), clustered in frames ~35–120 and ~330–425. That lets carving be
+credited directly: `scripts/eval_carving_credit.py` paints each moving actor's labelled
+footprint at every frame in a window (transformed into the reference frame exactly as the
+points are), takes the **trail** it left — where it *was* minus where it *is* — and asks what
+fraction of that trail carving retires, against the control of how much of the actor's *current*
+footprint it wrongly erases.
+
+| window | persistence | trail retired (credit) | actor kept (control) |
+| ---: | ---: | ---: | ---: |
+| 5 (operating point) | 2 | 9% | **96%** |
+| 10 | 2 | 17% | 91% |
+| 10 | 1 | 26% | 73% |
+| 15 | 1 | 24% | 66% |
+
+Read honestly, this is carving's real character, which occupancy-agreement could not show:
+
+- **Carving does forget moving actors — the effect is real, not zero.** At every setting it
+  retires a nonzero slice of the trail, rising with the window (more frames of see-through
+  evidence) and with a looser `carve_persistence`.
+- **But at the safe operating point the effect is modest (9%), and you cannot simply crank it.**
+  Pushing the window or dropping persistence to retire more trail also drives *actor kept* down
+  to 66–73% — carving starts erasing the actor where it **actually is**, the one error that can
+  cause a crash. The safe corner (window 5, persistence 2) keeps 96% of the present actor and
+  pays for it with a small trail credit.
+- **Why so conservative: the same height gate that makes carving safe caps its de-smear.** A
+  beam only clears a cell it crossed in the near-ground band, so it cannot erase an obstacle it
+  merely flew *over* — the property that passes `test_carving_spares_an_obstacle_a_beam_passes_over`.
+  A vacated trail cell is only retired if a later beam actually grazed the ground there, which on
+  a short window at range is often no beam at all. Carving's safety and its forgetting are the
+  same mechanism seen from two sides.
+
+Reproduce: `python3 scripts/eval_carving_credit.py --window 5 --persistence 2` (needs the
+labels: `fetch_kitti.py --tracklets`).
+
 ### The planner on a carved map (200 episodes)
 
 The map-fidelity metric could not credit carving, so the other place it can show is the
