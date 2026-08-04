@@ -28,7 +28,7 @@ from typing import Callable, Optional, Protocol
 import numpy as np
 
 from .bev import BEVConfig, BEVGrid, occupancy_from_scan
-from .mapping import MapConfig, drop_ego_returns, fuse_scans, window_indices
+from .mapping import MapConfig, drop_ego_returns, fuse_map, fuse_scans, window_indices
 from .vehicle import (
     ShieldResult,
     VehicleConfig,
@@ -309,9 +309,15 @@ class KittiScenes:
     frames: Optional[np.ndarray] = None        # restrict to these frames (e.g. a held-out split)
     vehicle: VehicleConfig = field(default_factory=VehicleConfig)
 
-    # None = one frozen scan (the original behaviour). Set it to accumulate a window.
+    # None = one frozen scan (the original behaviour). Set it to accumulate a window; set
+    # `MapConfig(carve=True)` to also free-space-carve it into an occupied/free/unknown map.
     map_config: Optional[MapConfig] = None
     poses: Optional[np.ndarray] = None         # camera-to-world; defaults to OXTS ground truth
+
+    # Only meaningful on a carved map: treat never-observed cells as obstacles for the shield
+    # and the policy's rays, rather than assuming them free. The honest reading of an
+    # accumulated map's interior holes; off keeps the old `outside_is_free` behaviour.
+    unknown_blocks: bool = False
 
     # Grids are cached by frame, which matters more than it looks: every episode resamples a
     # frame, and building a grid means loading scans *and* computing the distance transform
@@ -334,8 +340,15 @@ class KittiScenes:
 
         poses = self.drive.gt_poses if self.poses is None else self.poses
         idx = window_indices(i, self.map_config, self.drive.n_velodyne)
-        pts = fuse_scans([self.drive.velodyne(j) for j in idx],
-                         [poses[j] for j in idx], self.drive.T_cam2_velo)
+        scans = [self.drive.velodyne(j) for j in idx]
+        window_poses = [poses[j] for j in idx]
+
+        if self.map_config.carve:
+            fm = fuse_map(scans, window_poses, self.drive.T_cam2_velo, ref=-1,
+                          cfg=self.map_config, bev_cfg=self.bev)
+            return fm.to_bev_grid(unknown_blocks=self.unknown_blocks)
+
+        pts = fuse_scans(scans, window_poses, self.drive.T_cam2_velo)
         return BEVGrid(occupancy_from_scan(pts, self.bev), self.bev)
 
     def sample(self, rng: np.random.Generator) -> Scene:

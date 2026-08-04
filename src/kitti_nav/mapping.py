@@ -217,6 +217,17 @@ class MapConfig:
     # bounding the march also bounds its cost. `None` carves to the grid edge.
     carve_max_range: Optional[float] = 40.0
 
+    # Treat the disc of this radius (m) around the reference sensor as observed-free, not
+    # unknown. A roof-mounted lidar has a near-field ground blind spot — the lowest ring on
+    # drive 0009 first reaches the road ~4.45 m ahead — so the ego always sits in a donut it
+    # cannot see the ground of. Real AV stacks assume the road the vehicle is physically on is
+    # drivable; without that, `unknown_blocks` walls the car in at its own start (permitted
+    # speed 0 everywhere) — a sensor artefact, not genuine occlusion. This exemption makes
+    # `unknown` mean "real occlusion shadow / frontier" rather than "near-field blind spot".
+    # A real near-field *obstacle* is still seen by the upper rings and stays occupied, so
+    # only the unseen ground is freed. 0 disables it (the degenerate honest reading).
+    carve_near_field: float = 4.5
+
     def __post_init__(self) -> None:
         if self.window < 1:
             raise ValueError(f"window must be >= 1, got {self.window}")
@@ -490,10 +501,16 @@ class FusedMap:
     unknown: Optional[np.ndarray]            # (rows, cols) bool, or None if un-carved
     cfg: BEVConfig
 
-    def to_bev_grid(self, outside_is_free: bool = True) -> BEVGrid:
-        """The `BEVGrid` the planner consumes, carrying the `unknown` mask for measurement."""
+    def to_bev_grid(self, outside_is_free: bool = True,
+                    unknown_blocks: bool = False) -> BEVGrid:
+        """The `BEVGrid` the planner consumes, carrying the `unknown` mask.
+
+        `unknown_blocks` makes the shield and rays treat an unknown cell as an obstacle (the
+        honest reading); off, the mask is carried but unconsumed and the grid behaves as the
+        old binary one.
+        """
         return BEVGrid(self.occupied, self.cfg, outside_is_free=outside_is_free,
-                       unknown=self.unknown)
+                       unknown=self.unknown, unknown_blocks=unknown_blocks)
 
 
 def _assemble_map(pts_per_scan: Sequence[np.ndarray], origins: Sequence[np.ndarray],
@@ -520,10 +537,42 @@ def _assemble_map(pts_per_scan: Sequence[np.ndarray], origins: Sequence[np.ndarr
     retire = (occ > 0) & (misses > cfg.carve_persistence * hits)
     carved[retire] = 0
 
-    touched = (hits > 0) | (misses > 0)
-    free = (carved == 0) & touched
-    unknown = (carved == 0) & ~touched
+    # A cell is *observed* if any return landed in it (the sensor measured a surface there, at
+    # any height — most often the road), or a beam swept through it (a see-through miss). Only
+    # a cell that is neither is genuinely `unknown`. Counting returns of every height, not just
+    # obstacle-band hits, matters near the ego: a beam to a close ground return is too steep to
+    # spend any length in the near-ground miss band, so those cells earn no carving evidence —
+    # yet the ground under the car is plainly observed, and without this they would read as
+    # unknown and (with `unknown_blocks`) wall the car in at its own start.
+    observed = np.zeros(rows * cols, bool)
+    if len(fused):
+        _, ret_idx = _in_bounds_cells(fused, bev_cfg)
+        observed[ret_idx] = True
+    observed = observed.reshape(rows, cols) | (misses > 0)
+
+    # The near-field disc around the reference sensor is assumed observed-free: the roof lidar
+    # cannot see the ground under and just around the car (a blind donut), but the car is
+    # plainly on drivable road. Without this a carved map with `unknown_blocks` walls the
+    # vehicle in at its own start — a sensor artefact, not occlusion. See `carve_near_field`.
+    if cfg.carve_near_field and cfg.carve_near_field > 0:
+        observed |= _near_field_mask(cfg.carve_near_field, bev_cfg)
+
+    free = (carved == 0) & observed
+    unknown = (carved == 0) & ~observed
     return FusedMap(carved, free, unknown, bev_cfg)
+
+
+def _near_field_mask(radius: float, bev_cfg: BEVConfig) -> np.ndarray:
+    """Boolean `(rows, cols)` grid, True for cells whose centre is within `radius` m of origin.
+
+    The reference sensor is at the origin in the fused frame, so this is the near-field disc
+    the ego occupies — assumed drivable road the lidar simply cannot see the ground of.
+    """
+    rows, cols = bev_cfg.shape
+    xs = bev_cfg.x_min + (np.arange(rows) + 0.5) * bev_cfg.resolution
+    ys = bev_cfg.y_min + (np.arange(cols) + 0.5) * bev_cfg.resolution
+    gx, gy = np.meshgrid(xs, ys, indexing="ij")
+    return (gx * gx + gy * gy) <= radius * radius
 
 
 def fuse_map(scans: Sequence[np.ndarray], poses: Sequence[np.ndarray],

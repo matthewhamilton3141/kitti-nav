@@ -229,6 +229,54 @@ def test_points_outside_the_grid_follow_the_outside_policy(cfg):
     assert strict.distance_to_obstacles(far)[0] == -np.inf
 
 
+# --- the third occupancy class: unknown -----------------------------------------------------
+
+def test_unknown_mask_is_inert_by_default(cfg):
+    """Carrying an `unknown` mask changes nothing until `unknown_blocks` is asked for.
+
+    This is the reproducibility guarantee: a carved map can hand its mask to every consumer and
+    no existing number moves unless the honest reading is explicitly turned on.
+    """
+    occ = np.zeros(cfg.shape, np.uint8)
+    occ[100, 100] = 1
+    unknown = np.zeros(cfg.shape, bool)
+    unknown[:20, :] = True                          # a big unobserved band
+    plain = BEVGrid(occ, cfg)
+    carried = BEVGrid(occ, cfg, unknown=unknown)    # mask present, unknown_blocks off
+    assert np.array_equal(plain.blocking, carried.blocking)
+    assert np.allclose(plain.distance_field, carried.distance_field)
+
+
+def test_unknown_blocks_makes_unknown_cells_obstacles(cfg):
+    """With the flag on, an unknown cell is as impassable as an occupied one."""
+    occ = np.zeros(cfg.shape, np.uint8)
+    unknown = np.zeros(cfg.shape, bool)
+    r, c = cfg.shape[0] // 2, cfg.shape[1] // 2
+    unknown[r, c] = True
+
+    free = BEVGrid(occ, cfg, unknown=unknown, unknown_blocks=False)
+    blocking = BEVGrid(occ, cfg, unknown=unknown, unknown_blocks=True)
+    assert not free.blocking.any()                              # unknown ignored
+    assert blocking.blocking[r, c] and blocking.blocking.sum() == 1
+    xy = blocking.cell_to_world(np.array([[r, c]]))
+    assert np.isinf(free.distance_to_obstacles(xy)[0])          # no obstacle to free
+    assert blocking.distance_to_obstacles(xy)[0] == 0.0         # standing on the obstacle
+
+
+def test_unknown_blocks_stops_a_ray(cfg):
+    """A forward ray halts at an unknown cell the same way it halts at an occupied one."""
+    occ = np.zeros(cfg.shape, np.uint8)
+    unknown = np.zeros(cfg.shape, bool)
+    wall_r = int((15.0 - cfg.x_min) / cfg.resolution)
+    unknown[wall_r, :] = True                                   # unknown wall across +x at 15 m
+
+    origin, angles = np.array([0.0, 0.0]), np.zeros(1)
+    free = BEVGrid(occ, cfg, unknown=unknown, unknown_blocks=False)
+    blocking = BEVGrid(occ, cfg, unknown=unknown, unknown_blocks=True)
+    assert free.ray_distances(origin, 0.0, angles, max_range=30.0)[0] == 30.0
+    assert 14.0 < blocking.ray_distances(origin, 0.0, angles, max_range=30.0)[0] < 16.0
+
+
 def test_grid_extent_is_checked_against_the_braking_envelope(cfg):
     grid = BEVGrid(np.zeros(cfg.shape, np.uint8), cfg)
     assert grid.covers_stopping_distance(25.0)

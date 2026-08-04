@@ -260,10 +260,50 @@ trades one against the other:
 The verdict: carving is implemented and sound, but its payoff is **not demonstrable on a
 static drive through the map-fidelity metric** — and knowing *why* (the benefit is symmetric,
 so it cancels; the drive is too static to have much to forget) is the finding. Where it should
-show is a drive with real traffic, or the planner itself: a policy driving a carved map is the
-deferred next measurement. Cost is ~40–350 ms per map (2 to 20 scans), dominated by the march.
+show is a drive with real traffic, or the planner itself. Cost is ~40–350 ms per map (2 to 20
+scans), dominated by the march.
 
 ![carved-map sweep](../docs/mapping_carved.png)
+
+### The planner on a carved map (200 episodes)
+
+The map-fidelity metric could not credit carving, so the other place it can show is the
+planner. Every policy is the same synthetic-trained one, evaluated on three versions of the
+five-scan real map: fused (the accumulated map, unknown assumed free), carved (see-through
+cells retired), and carved with an **honest** occupied/free/unknown reading where a cell no ray
+ever observed is treated as an obstacle for both the shield and the policy's rays.
+
+| policy | fused (5) | carved (5) | carved + unknown-blocks |
+| --- | --- | --- | --- |
+| gap-following | 59% / 82 coll | 60% / 79 | 4% / 192 |
+| gap-following + shield | 54% / **0** | 56% / **0** | 4% / **0** |
+| PPO (raw) | 66% / 67 | **70% / 60** | 4% / 172 |
+| PPO (raw) + shield at eval | 62% / **0** | 62% / **0** | 4% / **0** |
+| PPO through shield | 64% / **0** | 66% / **0** | 4% / **0** |
+
+Three things, in order of how much they matter:
+
+- **The shield holds 0 collisions in every column**, including the degenerate one where the map
+  is majority-obstacle and the car can barely move. This is the strongest form of the repo's
+  headline: the braking certificate is re-derived from whatever occupancy it is handed, so a
+  map that is *more* obstacle only makes it more conservative, never unsound. Handed a map where
+  half the world is a wall, it still never admits a collision.
+- **Carving wins a little back.** Fusion cost the unshielded PPO ~12 points (78% single → 66%
+  fused); carving returns ~4 of them (66 → 70%, collisions 67 → 60), and every other row moves
+  the same small, safe direction (never worse). It does *not* recover the whole drop, and it
+  should not: most of that drop is real obstacles a single scan was blind to, which carving
+  correctly keeps. This is the first positive signal for carving anywhere in the repo — the
+  map-fidelity metric could only show its cost.
+- **Hard unknown-blocking is unnavigable here (4%).** Treating every unobserved cell as an
+  obstacle collapses success across all policies: an accumulated single-drive map is >50%
+  unknown (behind the frontier, in occlusion shadows, between rings), so there is no clear path
+  to a goal 20–35 m away. It took two fixes just to get off 0% — crediting any cell with a
+  return as observed, and exempting the lidar's ~4 m near-field ground blind spot (a roof lidar
+  cannot see the road directly under the car; real stacks assume it is drivable) — and even then
+  the through-path is walled. The honest reading is *sound* (the shield never lies) but too
+  strict to *drive*: it wants a frontier-only or free-for-traversal softening, which is the next
+  question. This is why `outside_is_free`/unknown-as-free is the pragmatic default, now with a
+  measured reason rather than an assumption.
 
 ## Reproduce
 
@@ -276,6 +316,9 @@ python3 scripts/eval_mapping.py --audit-ego
 python3 scripts/eval_mapping.py --sweep 1 2 3 5 10 20 --every 12 --max-speed 21 --carve \
   --plot docs/mapping_carved.png
 python3 scripts/eval_mapping.py --sweep 5 10 20 --every 12 --carve --carve-persistence 4
+
+# the planner on carved maps: fused vs carved vs carved+unknown-blocks
+python3 scripts/eval_policies.py --episodes 200 --carve --fused-window 5
 
 python3 scripts/train_ppo.py --steps 600000 --out models/ppo_raw
 python3 scripts/train_ppo.py --steps 600000 --shield --out models/ppo_shielded

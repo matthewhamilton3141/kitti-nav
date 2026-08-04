@@ -59,10 +59,21 @@ def scene_sources(args):
         from kitti_nav.mapping import MapConfig
 
         drive = KittiDrive(args.date, args.drive)
+        w = args.fused_window
         sources["KITTI (single scan)"] = lambda: KittiScenes(drive=drive)
-        if args.fused_window > 1:
-            sources[f"KITTI (fused, {args.fused_window} scans)"] = lambda: KittiScenes(
-                drive=drive, map_config=MapConfig(window=args.fused_window))
+        if w > 1:
+            sources[f"KITTI (fused, {w} scans)"] = lambda: KittiScenes(
+                drive=drive, map_config=MapConfig(window=w))
+            # Free-space carving, two ways: with unknown cells assumed free (isolates what
+            # carving's obstacle removal does to the planner) and with unknown cells blocking
+            # (adds the honest reading that unobserved space is not certified drivable). The
+            # gap between the two is the price of that honesty.
+            if args.carve:
+                sources[f"KITTI (carved, {w} scans)"] = lambda: KittiScenes(
+                    drive=drive, map_config=MapConfig(window=w, carve=True))
+                sources[f"KITTI (carved+unknown, {w} scans)"] = lambda: KittiScenes(
+                    drive=drive, map_config=MapConfig(window=w, carve=True),
+                    unknown_blocks=True)
     return sources
 
 
@@ -76,6 +87,8 @@ def main() -> int:
     p.add_argument("--no-kitti", action="store_true", help="synthetic scenes only")
     p.add_argument("--fused-window", type=int, default=5,
                    help="scans fused for the accumulated-map column; 1 disables it")
+    p.add_argument("--carve", action="store_true",
+                   help="add free-space-carved KITTI columns (unknown free, then blocking)")
     args = p.parse_args()
 
     base = DriveNavConfig()

@@ -47,7 +47,7 @@ The seed idea was `gsplat-rt`'s nav capstone: a hard safety shield wrapping any 
 question was whether it survives contact with *driving*. Mostly it did — but almost nothing
 ported unchanged, and one of its headline results did not reproduce (below).
 
-## Status — **148 tests green** (on `feat/map-fusion`; `main` is at 105)
+## Status — **153 tests green** (on `feat/map-fusion`; `main` is at 105)
 
 | milestone | state | measured |
 | --- | --- | --- |
@@ -60,7 +60,7 @@ ported unchanged, and one of its headline results did not reproduce (below).
 | Shield-in-the-loop, 5-seed replication | done | **negative result** (see below) |
 | **VO poses + lidar fused into an accumulated map** | done — *on the branch* | **1.86× the scene mapped at 5 scans** |
 | **Planner driving the fused map** | done — *on the branch* | **shield still 0 collisions; success −12 to −14 pts** |
-| **Free-space carving + occupied/free/unknown map** | done — *on the branch* | **sound (unit-tested); non-result on this static drive (below)** |
+| **Free-space carving + occupied/free/unknown map** | done — *on the branch* | **map-metric non-result, but carving wins +4 pts on the planner; shield 0 collisions on every map (below)** |
 
 Full numbers: `README.md` and `scripts/RESULTS.md`.
 
@@ -97,13 +97,38 @@ purpose, and re-deriving it wastes a day.**
   (unsafe direction unchanged, 3/36 @ +0.57). Keep carving to short windows.
 - **The dead end, so it is not retried:** tuning `carve_persistence` (swept 2/4/8) does not find
   a value that both de-smears and keeps missed flat — higher just makes carving more inert. The
-  payoff is not demonstrable through `eval_mapping` on a static drive. Where it *would* show is
-  a drive with traffic, or the planner itself — a policy on a carved map (deferred, below).
+  payoff is not demonstrable through `eval_mapping` on a static drive. Where it *does* show is
+  the planner — see the next section.
 
-Scope was deliberately held here: the shield and RL rays still read `occupancy` alone, so the
-`unknown` mask changes no existing number yet. Wiring honest "unknown blocks" semantics into
-`distance_to_obstacles`/`ray_distances` and re-running `eval_policies.py --fused-window` is the
-follow-up that would actually measure whether carving wins back some of the 12–14 lost points.
+## This session too: honest "unknown blocks" semantics + the carved-map planner measurement
+
+The deferred half of the carving plan is done. `BEVGrid.unknown_blocks` folds the `unknown`
+mask into the shield's `distance_field` and the policy's `ray_distances` (via a `blocking`
+property = `occupancy` or `occupancy | unknown`); `KittiScenes(unknown_blocks=…)` builds carved
+tri-state scenes with `fuse_map`; `eval_policies.py --carve` adds two columns. All off by
+default — the un-carved policy numbers reproduce.
+
+`eval_policies.py --episodes 200 --carve --fused-window 5` gives three KITTI columns per policy
+(fused / carved / carved+unknown-blocks). **Three findings, and do not re-derive them:**
+
+1. **The shield holds 0 collisions in every column**, including carved+unknown where the map is
+   majority-obstacle and the car barely moves. Strongest form of the headline: the certificate
+   is re-derived from whatever occupancy it is handed, so more obstacle only makes it more
+   conservative, never unsound.
+2. **Carving wins ~4 of the ~12 points fusion cost back** (PPO raw 66% fused → 70% carved, coll
+   67 → 60); every other row moves the same small, safe direction. It does *not* recover the
+   whole drop, and should not — most of that drop is real geometry a single scan missed, which
+   carving keeps. First positive signal for carving anywhere; the map metric could only show cost.
+3. **Hard unknown-blocking is unnavigable (4% success everywhere).** A single-drive accumulated
+   map is >50% unknown, so treating every unobserved cell as blocked leaves no path to a 20–35 m
+   goal. It took two correctness fixes just to get off 0% — crediting any cell with a *return* as
+   observed (not just obstacle-band hits), and exempting the roof lidar's ~4 m near-field ground
+   blind spot (`carve_near_field`, the ego is on road it cannot see under) — and the through-path
+   is still walled. The honest reading is **sound but too strict to drive**: it wants a
+   frontier-only / free-for-traversal softening. This is *why* unknown-as-free is the pragmatic
+   default, now measured rather than assumed.
+
+Reproduce: `python3 scripts/eval_policies.py --episodes 200 --carve --fused-window 5`.
 
 Reproduce: `python3 scripts/eval_mapping.py --sweep 1 2 3 5 10 20 --every 12 --max-speed 21 --carve`.
 
@@ -264,13 +289,15 @@ Seed spread was small (1.0–2.9 pts), unusually low for deep RL. Sweep cost ~35
   it, and `eval_mapping` cannot credit it (the benefit cancels when both maps are carved). The
   open work is measuring it where it can pay off: the planner, or a drive with real traffic.
   KITTI raw has tracklets for some drives.
-- **No free/unknown distinction *in the consumers* — carving added the mask, not the
-  semantics.** `BEVGrid` now carries an `unknown` mask, but the shield and RL rays still read
-  `occupancy` alone, so `outside_is_free=True` is still the operative assumption. The largest
-  optimistic (unsafe-direction) excursions are still obstacles near `x_max = 50 m` that drift
-  pushes across the boundary into assumed-free space — and carving *worsens* them at large
-  windows (+21 m/s at 20 scans). Wiring "unknown blocks" into `distance_to_obstacles`/
-  `ray_distances` is the deferred half of the carving work.
+- **The free/unknown distinction is wired but too strict to drive.** `unknown_blocks` now folds
+  the `unknown` mask into the shield and rays (done this session), and it is *sound* — the shield
+  holds 0 collisions on it — but a single-drive map is >50% unknown, so hard blocking is
+  unnavigable (4% success). It needs a **frontier-only / free-for-traversal softening** (only the
+  observed-free→unknown boundary blocks, or unknown is traversable but capped), which is the open
+  design question. Until then `outside_is_free=True` / unknown-as-free stays the operative
+  default. Separately, the largest optimistic (unsafe-direction) excursions are still obstacles
+  near `x_max = 50 m` that drift pushes across the boundary — carving *worsens* them at large
+  windows (+21 m/s at 20 scans), another reason to keep the window short.
 - **The grid cannot certify above 21.2 m/s.** `sqrt(2 · 4.5 · 50)`. Any permitted speed above
   that is `outside_is_free` talking, not the sensor — which is why `eval_mapping.py` caps at 21
   while `render_bev.py` still uses 35. Worth reconciling.
@@ -290,27 +317,30 @@ Seed spread was small (1.0–2.9 pts), unusually low for deep RL. Sweep cost ~35
 
 ## What next — options
 
-**My recommendation: (1) then (2).** Free-space carving (last handoff's option 1) is done, but
-it landed as a non-result on this drive (above) — so the two things that would actually pay it
-off both move to the top.
+**My recommendation: (1) then (2).** Free-space carving *and* the honest-unknown planner
+measurement are both done now (above): carving wins ~4 pts back on the planner, the shield stays
+sound on every map, and hard unknown-blocking is too strict to drive. What is left is making the
+honest reading *usable*, and finding a drive where carving's de-smear can be credited.
 
-1. **Carving where it can be measured: the planner, or a drive with traffic.** `eval_mapping`
-   provably cannot credit carving on a static drive (the benefit cancels, no per-actor labels).
-   Two ways to fix that, in order of effort: (a) wire honest "unknown blocks" semantics into
-   `distance_to_obstacles`/`ray_distances` and re-run `eval_policies.py --fused-window` on a
-   carved map — the deferred half of this session's plan, and the direct test of the 12–14-point
-   question; (b) evaluate on a KITTI drive with real moving traffic (0009 is too static), where
-   the de-smear the unit tests prove would show up in the missed/phantom split.
-2. **Dynamic obstacles.** Parse KITTI tracklets (or synthesise moving actors) and extend the
+1. **Softer unknown semantics, so the honest map is drivable.** Hard `unknown_blocks` is sound
+   but unnavigable (4%). The fix is a **frontier-only** reading (only the observed-free→unknown
+   boundary blocks; deep unknown behind it is not double-counted) or **free-for-traversal-with-a-
+   cap** (unknown is passable but limits speed like a low-confidence region). Both are small
+   changes to `BEVGrid.blocking`/`ray_distances`; `eval_policies.py --carve` already has the
+   harness to score them against the fused and hard-blocking columns.
+2. **A drive with real traffic.** 0009 is too static for carving's de-smear to show in the map
+   metric or move the planner much. A drive with moving actors is where "carving forgets a car
+   that drove away" becomes a measurable win (and where dynamic obstacles, below, get real).
+3. **Dynamic obstacles.** Parse KITTI tracklets (or synthesise moving actors) and extend the
    shield to reason about a moving obstacle's reachable set rather than a static one. This is
    where the safety argument gets properly hard — and where "AV" actually lives. Carving is the
    representation that makes this tractable (it can forget an obstacle that moved).
-3. Evasive steering in the shield (search over steer candidates, not just two).
-4. Strengthen VO: local bundle adjustment or keyframing; SuperPoint+LightGlue front-end beat
+5. Evasive steering in the shield (search over steer candidates, not just two).
+6. Strengthen VO: local bundle adjustment or keyframing; SuperPoint+LightGlue front-end beat
    ORB in `gsplat-rt` (3.5 cm vs 5.7 cm ATE on TUM) but is box-gated. Note the mapping result
    lowers the priority of this: fusion is governed by *within-window* relative error, which is
    already 24 cm, not by the global drift bundle adjustment would fix.
-5. More drives / seeds to firm up generalisation claims.
+7. More drives / seeds to firm up generalisation claims.
 
 ## Environment / repo facts
 
@@ -335,7 +365,7 @@ off both move to the top.
 ## Commands worth knowing
 
 ```bash
-python3 -m pytest tests/ -q                     # 148 green; dataset tests skip without KITTI
+python3 -m pytest tests/ -q                     # 153 green; dataset tests skip without KITTI
 
 # mapping: the sweep behind the accumulated-map table, and the ego self-filter audit
 python3 scripts/eval_mapping.py --sweep 1 2 3 5 10 20 --every 12 --max-speed 21
@@ -347,6 +377,8 @@ python3 scripts/eval_mapping.py --sweep 5 10 20 --every 12 --carve --carve-persi
 
 # policies: prints synthetic + KITTI single-scan + KITTI fused, all three
 python3 scripts/eval_policies.py --episodes 200
+# ...and --carve adds carved + carved+unknown-blocks columns (the planner-on-carved-map table)
+python3 scripts/eval_policies.py --episodes 200 --carve --fused-window 5
 
 python3 scripts/eval_odometry.py --plot docs/trajectory.png
 python3 scripts/render_bev.py --frame 294 --speed-profile docs/speed_profile.png

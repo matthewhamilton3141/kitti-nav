@@ -188,7 +188,8 @@ class BEVGrid:
     """
 
     def __init__(self, occupancy: np.ndarray, cfg: BEVConfig | None = None,
-                 outside_is_free: bool = True, unknown: np.ndarray | None = None):
+                 outside_is_free: bool = True, unknown: np.ndarray | None = None,
+                 unknown_blocks: bool = False):
         self.cfg = cfg or BEVConfig()
         self.occupancy = np.asarray(occupancy, np.uint8)
         self.outside_is_free = outside_is_free
@@ -198,13 +199,17 @@ class BEVGrid:
         # Optional third occupancy class: cells no lidar ray ever passed through, as opposed
         # to cells observed and found clear. `None` (the default) is the binary map every
         # existing consumer sees — occupied vs "everything else is free". Free-space carving
-        # (`mapping.fuse_map` with carving on) fills this in; it is carried here for measurement and
-        # rendering only. The shield and the RL rays still read `occupancy` alone this pass,
-        # so an un-consumed `unknown` mask cannot change any existing number — folding it into
-        # `distance_field`/`ray_distances` is a deliberate later step.
+        # (`mapping.fuse_map` with carving on) fills this in.
         self.unknown = None if unknown is None else np.asarray(unknown, bool)
         if self.unknown is not None and self.unknown.shape != self.cfg.shape:
             raise ValueError(f"unknown {self.unknown.shape} != config shape {self.cfg.shape}")
+
+        # Whether the consumers — the shield's distance field and the policy's rays — treat an
+        # unknown cell as an obstacle. Off by default (unknown reads as free, the old binary
+        # behaviour, so every un-carved number is untouched); on, it is the honest reading that
+        # a cell no ray ever observed is not certified drivable. Only has an effect when an
+        # `unknown` mask is present, i.e. on a carved map.
+        self.unknown_blocks = bool(unknown_blocks)
 
     @classmethod
     def from_scan(cls, points: np.ndarray, cfg: BEVConfig | None = None,
@@ -231,28 +236,44 @@ class BEVGrid:
     def occupied_fraction(self) -> float:
         return float(self.occupancy.mean())
 
+    @cached_property
+    def blocking(self) -> np.ndarray:
+        """The cells the shield and rays must treat as impassable, as a `(rows, cols)` bool.
+
+        Occupied cells always block. Unknown cells block too when `unknown_blocks` is set and a
+        carved map supplied an `unknown` mask — the honest reading that unobserved space is not
+        certified clear. Without that flag this is exactly `occupancy`, so the binary map is
+        unchanged.
+        """
+        occ = self.occupancy.astype(bool)
+        if self.unknown_blocks and self.unknown is not None:
+            return occ | self.unknown
+        return occ
+
     # -- distance field ------------------------------------------------------------------
 
     @cached_property
     def distance_field(self) -> np.ndarray:
-        """Metres from each cell to the nearest occupied cell, as a float32 grid.
+        """Metres from each cell to the nearest blocking cell, as a float32 grid.
 
         Computed once with OpenCV's exact Euclidean distance transform and cached, because
         the shield queries it thousands of times per decision (candidate actions x braking
         horizon) and recomputing would dominate the runtime.
 
-        A half-cell-diagonal is subtracted so the result is a **conservative** lower bound:
-        the transform measures to the nearest occupied cell's *centre*, while the obstacle
-        may extend to that cell's corner. Under-reporting clearance can only make the shield
-        brake earlier than strictly necessary, never later.
+        "Blocking" is occupied cells, plus unknown cells when `unknown_blocks` is set — see
+        `blocking`. A half-cell-diagonal is subtracted so the result is a **conservative**
+        lower bound: the transform measures to the nearest blocking cell's *centre*, while the
+        obstacle may extend to that cell's corner. Under-reporting clearance can only make the
+        shield brake earlier than strictly necessary, never later.
         """
         import cv2
 
-        if not self.occupancy.any():
+        blocking = self.blocking
+        if not blocking.any():
             return np.full(self.occupancy.shape, np.inf, np.float32)
 
         # distanceTransform measures to the nearest ZERO pixel, so free cells must be nonzero.
-        free = (1 - self.occupancy).astype(np.uint8) * 255
+        free = (~blocking).astype(np.uint8) * 255
         dist = cv2.distanceTransform(free, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
         dist *= self.cfg.resolution
         half_diag = self.cfg.resolution * np.sqrt(2.0) / 2.0
@@ -288,7 +309,9 @@ class BEVGrid:
 
         `angles` are relative to `yaw`. Rays leaving the grid stop there when
         `outside_blocks`, which treats the edge of what the sensor mapped as a wall — the
-        honest reading, since unmapped space is unknown rather than known-clear.
+        honest reading, since unmapped space is unknown rather than known-clear. Interior
+        unknown cells (on a carved map) stop a ray the same way when `unknown_blocks` is set,
+        so the policy sees an occlusion shadow as a wall rather than driving into it.
         """
         rows, cols = self.cfg.shape
         step = self.cfg.resolution * 0.5
@@ -303,7 +326,7 @@ class BEVGrid:
         inside = (r >= 0) & (r < rows) & (c >= 0) & (c < cols)
 
         blocked = np.zeros(px.shape, bool)
-        blocked[inside] = self.occupancy[r[inside], c[inside]] > 0
+        blocked[inside] = self.blocking[r[inside], c[inside]]
         if outside_blocks:
             blocked |= ~inside
 

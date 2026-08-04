@@ -12,6 +12,8 @@ import pytest
 
 from kitti_nav.bev import BEVConfig, BEVGrid
 from kitti_nav.kitti import DEFAULT_DATA_DIR, KittiDrive
+from kitti_nav.mapping import MapConfig
+from kitti_nav.nav_env import KittiScenes
 from kitti_nav.odometry import StereoOdometry, evaluate_trajectory
 from kitti_nav.stereo import StereoDepth
 from kitti_nav.vehicle import (
@@ -206,6 +208,33 @@ def test_shield_runs_on_real_lidar_within_its_grid(drive):
                         grid, vcfg)
     assert np.isfinite(res.accel) and not res.ics
     assert -vcfg.max_decel <= res.accel <= vcfg.max_accel
+
+
+def test_kitti_scene_carves_a_tri_state_map(drive):
+    """A carved KittiScenes builds an occupied/free/unknown grid, not a binary one."""
+    scenes = KittiScenes(drive=drive, map_config=MapConfig(window=5, carve=True))
+    grid = scenes._build_grid(20)
+    assert grid.unknown is not None and grid.unknown.any()      # holes are marked, not free
+    assert grid.occupancy.any()                                 # real geometry survives
+
+
+def test_unknown_blocks_is_more_conservative_but_not_degenerate(drive):
+    """Honest unknown never permits *more* speed, and the near-field exemption keeps it usable.
+
+    Treating unobserved space as blocked can only lower the shield's permitted speed. The
+    near-field free assumption (`carve_near_field`) is what stops it collapsing to 0 on a roof
+    lidar's ground blind spot — so the honest reading is slower than assuming unknown is free,
+    but the car can still move.
+    """
+    mcfg = MapConfig(window=5, carve=True)
+    free = KittiScenes(drive=drive, map_config=mcfg, unknown_blocks=False)._build_grid(20)
+    blocking = KittiScenes(drive=drive, map_config=mcfg, unknown_blocks=True)._build_grid(20)
+
+    vcfg = VehicleConfig(max_speed=21.0)
+    state = drive.vehicle_state_in_lidar()
+    v_free = max_safe_speed(free, vcfg, state=state)
+    v_block = max_safe_speed(blocking, vcfg, state=state)
+    assert 0.0 < v_block <= v_free + 0.05, f"honest={v_block:.2f} free={v_free:.2f}"
 
 
 # --- end-to-end odometry -------------------------------------------------------------------
