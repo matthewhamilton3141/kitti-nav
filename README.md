@@ -25,8 +25,9 @@ Runs entirely on a laptop — pure NumPy + OpenCV, no GPU, no simulator install.
 | VO poses + lidar fused into an accumulated map | done — **1.9× the scene mapped at 5 scans** |
 | Planner driving the accumulated map | done — **still 0 collisions shielded, on harder geometry** |
 | Free-space carving + occupied/free/unknown map | done — **carving wins back ~4 of ~12 lost points; shield still 0 collisions, even on a fully-honest map** |
+| Cautious speed cap on unknown space | done — **honest map drivable: 4% → ~37% success, shield still 0 collisions** |
 
-**153 tests pass.** Dataset-backed tests skip cleanly when KITTI isn't downloaded; the
+**165 tests pass.** Dataset-backed tests skip cleanly when KITTI isn't downloaded; the
 environment core is pure NumPy and tests without any RL stack installed.
 
 ## Quickstart
@@ -315,9 +316,19 @@ in 100% of scans.
   sound (unit-tested) and off by default. The map-vs-GT metric can't credit it (carving both
   maps cancels the benefit; the drive is too static), but on the planner it wins back ~4 of the
   ~12 points fusion cost the PPO policy (66% → 70%) — while the shield holds **0 collisions** on
-  every version of the map, including a fully honest occupied/free/unknown reading that is so
-  conservative (>50% of a single-drive map is unobserved) the car can barely drive at all.
+  every version of the map, including a fully honest occupied/free/unknown reading.
   Details and numbers in [`scripts/RESULTS.md`](scripts/RESULTS.md).
+- **The honest map is unnavigable if you wall the car out of the unknown — but drivable if you
+  slow it down instead.** Treating every unobserved cell as an obstacle is *sound* (the shield
+  still never crashes) but leaves no path to a 20–35 m goal across a map that is >50% unknown:
+  4% success. The fix is to let the car **cross** unmapped space while a governor caps its
+  speed to what it could brake out of before the confidently-free frontier — it never enters
+  the unknown faster than it could halt at its threshold. That, plus closing the sensor-sparsity
+  holes in observed road (unknown cells enclosed by known-free cells), lifts success to **~37%**
+  with the shield still at **0 collisions**. The remaining gap to assuming-unknown-is-free
+  (60–70%) is the honest price of respecting what the sensor did not see, now measured. The
+  collision certificate is untouched — the governor only ever slows the car, so a certified
+  state stays certified.
 - **The far field runs out of grid.** The largest optimistic excursions are obstacles near
   `x_max = 50 m` that drift moves across the boundary, where `outside_is_free=True` reads
   them as clear. This is also why the sweep caps speed at 21 m/s: `sqrt(2 · 4.5 · 50)` is the

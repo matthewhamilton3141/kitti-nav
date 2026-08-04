@@ -14,13 +14,20 @@ from kitti_nav.nav_env import (
     DriveNavEnv,
     Scene,
     SyntheticScenes,
+    cautious_speed_cap,
     certifiable_start,
     evaluate,
     gap_following_policy,
     rasterize_circles,
     rollout,
 )
-from kitti_nav.vehicle import VehicleConfig, VehicleState, can_stop_safely
+from kitti_nav.vehicle import (
+    VehicleConfig,
+    VehicleState,
+    can_stop_safely,
+    clearance,
+    stopping_distance,
+)
 
 
 @pytest.fixture
@@ -242,6 +249,113 @@ def test_random_actions_never_collide_behind_the_shield(cfg):
     for i in range(15):
         result = rollout(env, lambda obs: rng.uniform(-1, 1, 2), seed=i)
         assert not result["collided"]
+
+
+# --- the cautious-unknown speed governor -------------------------------------------------------
+
+def _unknown_forward_of(x: float, bev: BEVConfig) -> np.ndarray:
+    """An unknown half-plane: every cell at or beyond `x` metres ahead is unobserved."""
+    unknown = np.zeros(bev.shape, bool)
+    unknown[int((x - bev.x_min) / bev.resolution):, :] = True
+    return unknown
+
+
+def test_speed_cap_keeps_the_bumper_short_of_an_unknown_frontier():
+    """The governor's guarantee: the car never enters unmapped space faster than it could halt.
+
+    Driven at full throttle with the collision shield off (so the cap is the *only* thing
+    limiting speed), the front bumper's braking-stop point must never cross the unknown
+    frontier at x = 15 m — through the discretisation, not merely in the continuous limit (see
+    the one-step reservation in `cautious_speed_cap`). The car then stalls short of it rather
+    than driving on blind.
+    """
+    bev, vcfg = BEVConfig(), VehicleConfig()
+    grid = BEVGrid(np.zeros(bev.shape, np.uint8), bev,
+                   unknown=_unknown_forward_of(15.0, bev), unknown_speed_cap=True)
+    env = DriveNavEnv(FixedScene(Scene(grid, VehicleState(v=8.0), np.array([30.0, 0.0]))),
+                      DriveNavConfig())
+    env.reset(0)
+    max_x = 0.0
+    for _ in range(150):
+        _, _, term, trunc, info = env.step(np.array([1.0, 0.0]))
+        s = info["state"]
+        assert s.x + vcfg.front_overhang + stopping_distance(s.v, vcfg) <= 15.0
+        max_x = max(max_x, s.x)
+        if term or trunc:
+            break
+    # Rear axle halts ~ front_overhang + margin (≈ 4.1 m) short of the frontier at x = 15 m.
+    assert 9.0 < max_x < 12.0
+
+
+def test_speed_cap_is_inert_without_an_unknown_mask():
+    """Reproducibility: the flag is a no-op off a carved map, so no existing number moves."""
+    bev = BEVConfig()
+
+    def run(grid):
+        env = DriveNavEnv(
+            FixedScene(Scene(grid, VehicleState(v=5.0), np.array([30.0, 0.0]))),
+            DriveNavConfig())
+        env.reset(0)
+        xs = []
+        for _ in range(40):
+            _, _, term, trunc, info = env.step(np.array([1.0, 0.0]))
+            xs.append(info["state"].x)
+            if term or trunc:
+                break
+        return xs
+
+    capped = run(BEVGrid(np.zeros(bev.shape, np.uint8), bev, unknown_speed_cap=True))
+    plain = run(BEVGrid(np.zeros(bev.shape, np.uint8), bev))
+    assert capped == plain
+
+
+def test_speed_cap_leaves_the_shield_sound():
+    """The governor only ever lowers acceleration, so it cannot break the braking certificate.
+
+    Full throttle straight at a real occupied wall, shield on and the cap on as well: a slower
+    car on the same braking path still stops clear, so the collision count stays zero.
+    """
+    bev, vcfg = BEVConfig(), VehicleConfig()
+    occ = rasterize_circles(np.array([[18.0, 0.0, 3.0]]), bev)   # a genuine obstacle
+    grid = BEVGrid(occ, bev, unknown=_unknown_forward_of(30.0, bev), unknown_speed_cap=True)
+    shielded = replace(DriveNavConfig(), use_shield=True)
+    start = certifiable_start(VehicleState(v=8.0), grid, vcfg)
+    env = DriveNavEnv(FixedScene(Scene(grid, start, np.array([40.0, 0.0]))), shielded)
+    env.reset(0)
+    for _ in range(80):
+        _, _, term, trunc, info = env.step(np.array([1.0, 0.0]))
+        assert not info["collided"], "the cap must not undo the shield"
+        if term or trunc:
+            break
+
+
+def test_cap_does_not_turn_unknown_into_collision_geometry():
+    """Why the cap is drivable where hard `unknown_blocks` is not.
+
+    Hard-blocking makes an unknown cell an obstacle, so unknown hugging a tight corridor puts
+    the car's own footprint in collision and walls it in. The cap leaves collision a function
+    of occupancy alone — the car may sit in and cross unknown space — which is the whole point.
+    """
+    bev, vcfg = BEVConfig(), VehicleConfig()
+    occ = np.zeros(bev.shape, np.uint8)
+    unknown = np.ones(bev.shape, bool)
+    c_lo = int((-1.0 - bev.y_min) / bev.resolution)
+    c_hi = int((1.0 - bev.y_min) / bev.resolution)
+    unknown[:, c_lo:c_hi] = False                       # a free corridor tighter than the car
+    state = VehicleState(x=5.0, y=0.0, yaw=0.0, v=3.0)
+
+    blocking = BEVGrid(occ, bev, unknown=unknown, unknown_blocks=True)
+    capped = BEVGrid(occ, bev, unknown=unknown, unknown_speed_cap=True)
+    assert clearance(state, blocking, vcfg) < 0.0       # footprint overlaps the unknown walls
+    assert np.isinf(clearance(state, capped, vcfg))     # occupancy is empty: no collision
+
+
+def test_cautious_speed_cap_is_max_speed_where_the_way_ahead_is_confidently_clear():
+    """A carved map whose forward corridor is all observed-free imposes no cap at all."""
+    bev, vcfg = BEVConfig(), VehicleConfig()
+    unknown = np.zeros(bev.shape, bool)                 # nothing unobserved ahead
+    grid = BEVGrid(np.zeros(bev.shape, np.uint8), bev, unknown=unknown, unknown_speed_cap=True)
+    assert cautious_speed_cap(VehicleState(v=5.0), grid, vcfg) == vcfg.max_speed
 
 
 # --- Gymnasium wrapper -------------------------------------------------------------------------

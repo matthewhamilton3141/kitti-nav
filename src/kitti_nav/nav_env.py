@@ -57,6 +57,38 @@ def certifiable_start(state: VehicleState, grid: BEVGrid,
     return VehicleState(state.x, state.y, state.yaw, min(state.v, ceiling), state.steer)
 
 
+def cautious_speed_cap(state: VehicleState, grid: BEVGrid, vehicle: VehicleConfig,
+                       half_cone: float = 0.15, n_rays: int = 3) -> float:
+    """Speed (m/s) the car may run given how far confidently-free space extends ahead.
+
+    The drivable reading of an accumulated map's unknown holes. Hard `unknown_blocks` walls
+    the car out of every unobserved cell and is unnavigable (a single drive is >50% unknown);
+    this instead lets the car *traverse* unknown space but never enter it faster than it could
+    brake to rest at its threshold — `v_cap = sqrt(2 * max_decel * d)`, the inverse of
+    `stopping_distance`. `d` is the distance ahead to the nearest occupied-or-unknown cell,
+    measured over a narrow forward cone (the braking path is roughly straight; a wide cone
+    would see the unknown *beside* the corridor and cap to a standstill), shrunk by the front
+    overhang and safety margin so the bumper — not the rear axle — is what stops short.
+
+    This is a governor layered on top of the collision shield, never a replacement: it only
+    ever lowers the commanded acceleration, so a state the shield certified stays certified (a
+    slower car on the same braking path still stops clear). Returns `max_speed` when the map
+    carries no `unknown` mask, i.e. it is a no-op off a carved map.
+
+    One control step of travel (`v * dt`) is reserved in the effective distance: the cap is
+    read at the step's start but the car moves a full step before it can re-brake, so without
+    the reservation it would lag the shrinking frontier by a step and nose past it. With it,
+    the bumper stays short of the frontier through the discretisation, not merely in the limit.
+    """
+    if grid.unknown is None:
+        return vehicle.max_speed
+    angles = np.linspace(-half_cone, half_cone, n_rays) if n_rays > 1 else np.zeros(1)
+    d = float(grid.confident_clear_distance(state.xy, state.yaw, angles).min())
+    reach = max(state.v, 0.0) * vehicle.dt
+    d_eff = max(0.0, d - vehicle.front_overhang - vehicle.safety_margin - reach)
+    return float(min(np.sqrt(2.0 * vehicle.max_decel * d_eff), vehicle.max_speed))
+
+
 @dataclass(frozen=True)
 class Scene:
     """One episode's world: static occupancy, where the car starts, where it must reach."""
@@ -203,6 +235,13 @@ class DriveNavEnv:
                                              self.scene.grid, cfg.vehicle)
             accel, steer = self.last_shield.accel, self.last_shield.steer
 
+        # Cautious-unknown governor (see `cautious_speed_cap`): on a carved map that requests
+        # it, cap speed by the frontier distance. It only ever *lowers* accel, so it cannot
+        # undo the shield's braking certificate — a slower car on the same path still stops.
+        if getattr(self.scene.grid, "unknown_speed_cap", False):
+            v_cap = cautious_speed_cap(self._state, self.scene.grid, cfg.vehicle)
+            accel = min(accel, (v_cap - self._state.v) / cfg.vehicle.dt)
+
         self._state = step_state(self._state, accel, steer, cfg.vehicle)
         self._step += 1
 
@@ -319,6 +358,11 @@ class KittiScenes:
     # accumulated map's interior holes; off keeps the old `outside_is_free` behaviour.
     unknown_blocks: bool = False
 
+    # The drivable alternative to `unknown_blocks` (and independent of it): let the car
+    # traverse unknown cells but have the env govern its speed by the frontier distance, so it
+    # never enters unmapped space faster than it could brake out of. See `cautious_speed_cap`.
+    unknown_speed_cap: bool = False
+
     # Grids are cached by frame, which matters more than it looks: every episode resamples a
     # frame, and building a grid means loading scans *and* computing the distance transform
     # the shield queries. Without this a training run rebuilds the same few grids thousands
@@ -346,7 +390,8 @@ class KittiScenes:
         if self.map_config.carve:
             fm = fuse_map(scans, window_poses, self.drive.T_cam2_velo, ref=-1,
                           cfg=self.map_config, bev_cfg=self.bev)
-            return fm.to_bev_grid(unknown_blocks=self.unknown_blocks)
+            return fm.to_bev_grid(unknown_blocks=self.unknown_blocks,
+                                  unknown_speed_cap=self.unknown_speed_cap)
 
         pts = fuse_scans(scans, window_poses, self.drive.T_cam2_velo)
         return BEVGrid(occupancy_from_scan(pts, self.bev), self.bev)

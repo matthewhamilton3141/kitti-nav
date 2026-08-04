@@ -277,6 +277,59 @@ def test_unknown_blocks_stops_a_ray(cfg):
     assert 14.0 < blocking.ray_distances(origin, 0.0, angles, max_range=30.0)[0] < 16.0
 
 
+# --- confident-clear distance: the geometry the speed governor caps against -----------------
+
+def test_cautious_blocking_ignores_the_unknown_blocks_flag(cfg):
+    """`cautious_blocking` is occupied|unknown regardless of how the shield treats unknown."""
+    occ = np.zeros(cfg.shape, np.uint8)
+    occ[100, 100] = 1
+    unknown = np.zeros(cfg.shape, bool)
+    unknown[50, 50] = True
+
+    for flag in (False, True):
+        grid = BEVGrid(occ, cfg, unknown=unknown, unknown_blocks=flag)
+        assert grid.cautious_blocking[100, 100] and grid.cautious_blocking[50, 50]
+        assert grid.cautious_blocking.sum() == 2
+
+    # With no mask it collapses to occupancy, so an un-carved map is unaffected.
+    assert np.array_equal(BEVGrid(occ, cfg).cautious_blocking, occ.astype(bool))
+
+
+def test_confident_clear_distance_stops_at_unknown_not_just_occupied(cfg):
+    """The frontier distance halts at an unknown wall even when the shield lets rays through.
+
+    This is the whole point of measuring against `cautious_blocking` rather than `blocking`:
+    the governor must see the edge of confidently-free space regardless of `unknown_blocks`.
+    """
+    occ = np.zeros(cfg.shape, np.uint8)
+    unknown = np.zeros(cfg.shape, bool)
+    wall_r = int((15.0 - cfg.x_min) / cfg.resolution)
+    unknown[wall_r, :] = True                                   # unknown wall at +x = 15 m
+
+    grid = BEVGrid(occ, cfg, unknown=unknown, unknown_blocks=False)
+    # A collision ray sees nothing (unknown_blocks off); the frontier ray still stops at 15 m.
+    assert grid.ray_distances(np.zeros(2), 0.0, np.zeros(1), max_range=30.0)[0] == 30.0
+    d = grid.confident_clear_distance(np.zeros(2), 0.0, np.zeros(1), max_range=30.0)[0]
+    assert 14.0 < d < 16.0
+
+
+def test_confident_clear_distance_takes_the_cone_minimum(cfg):
+    """A fan returns the nearest frontier across the cone, so the cap is the conservative one."""
+    occ = np.zeros(cfg.shape, np.uint8)
+    unknown = np.zeros(cfg.shape, bool)
+    # An unknown block off to the +y side, closer than anything straight ahead.
+    r0, r1 = int((7.0 - cfg.x_min) / cfg.resolution), int((9.0 - cfg.x_min) / cfg.resolution)
+    c0, c1 = int((2.0 - cfg.y_min) / cfg.resolution), int((4.0 - cfg.y_min) / cfg.resolution)
+    unknown[r0:r1, c0:c1] = True
+
+    grid = BEVGrid(occ, cfg, unknown=unknown)
+    wide = grid.confident_clear_distance(np.zeros(2), 0.0, np.linspace(-0.6, 0.6, 9),
+                                         max_range=30.0)
+    ahead = grid.confident_clear_distance(np.zeros(2), 0.0, np.zeros(1), max_range=30.0)[0]
+    assert ahead == 30.0                          # a straight ray misses the off-axis block
+    assert float(wide.min()) < 12.0               # a wide cone reaches it and reports it
+
+
 def test_grid_extent_is_checked_against_the_braking_envelope(cfg):
     grid = BEVGrid(np.zeros(cfg.shape, np.uint8), cfg)
     assert grid.covers_stopping_distance(25.0)

@@ -3,6 +3,43 @@
 Plain-English "pick up here." The README is the polished public account; this is the working
 notes — what was decided and why, what broke, and what is actually left.
 
+## Latest session (2026-08-04, second sitting): the honest map is drivable now
+
+Option 1 from the previous handoff — "softer unknown semantics, so the honest map is
+drivable" — is **done, and it works**. Hard `unknown_blocks` was sound but unnavigable (4%
+success); the new **cautious speed cap** lifts that to **34–40%** while the shield stays at **0
+collisions on every shielded row**. On `feat/map-fusion`, pushed pending, **165 tests green**.
+
+What was built, and the two decisions inside it:
+
+- **A separate speed governor, not a change to the shield** (this was the explicit design
+  fork, and separation was chosen). The collision certificate is untouched — it still runs
+  against occupancy alone. Unknown space is *traversable* but the env caps speed to
+  `sqrt(2·max_decel·d)` where `d` is the forward distance to the confidently-free frontier, so
+  the car never enters unmapped space faster than it could brake to a halt at its threshold
+  (`nav_env.cautious_speed_cap`, `bev.BEVGrid.confident_clear_distance`). Because the governor
+  only ever *lowers* accel, a shield-certified state stays certified.
+- **A frontier-only reading was rejected by analysis, not built.** For the shield/rays,
+  `blocking = occupied ∪ unknown` and `occupied ∪ frontier-unknown` give the *same* distance
+  field for any query point in free space (the nearest unknown to a free cell is always a
+  frontier cell). So frontier-only ≈ hard-block ≈ 4%. Don't build it; the no-op is proven.
+- **Unknown hole-closing was the missing piece** (`MapConfig.close_unknown`, an OpenCV
+  morphological close). The raw cap stalled at the ~10 m observation horizon: a single drive's
+  observed road is speckled with `unknown` between lidar rings, so the confidently-free
+  corridor only reaches a **median 10 m** — short of the 20–35 m goals. Closing unknown cells
+  *enclosed* by observed road (not genuine occlusion, which stays open and unclosed) doubles
+  the corridor to a **median 21 m**, into goal range, without touching any occupied cell. This
+  is what turns 4% into ~37%. Scoped to the cap column only, so every other column reproduces.
+
+**The honest read of the remaining gap:** the cap reaches ~37%, not the 60–70% of
+unknown-as-free. That gap is *not* a defect — it is the genuine cost of respecting unobserved
+space (slowing/stopping at real occlusion frontiers) instead of assuming it drivable. It is now
+measured rather than assumed. `outside_is_free`/unknown-as-free stays the optimistic default;
+the cap is the drivable *honest* one. Full numbers below and in `scripts/RESULTS.md`.
+
+Reproduce: `python3 scripts/eval_policies.py --episodes 200 --carve --fused-window 5` (the
+`carved+cap` column). ~15 min on the Mac.
+
 ## ⚠ Read first: the tree is not where you'd assume
 
 **All the mapping/carving work is on `feat/map-fusion`, pushed, and NOT merged to `main`.**
@@ -51,7 +88,7 @@ The seed idea was `gsplat-rt`'s nav capstone: a hard safety shield wrapping any 
 question was whether it survives contact with *driving*. Mostly it did — but almost nothing
 ported unchanged, and one of its headline results did not reproduce (below).
 
-## Status — **153 tests green** (on `feat/map-fusion`; `main` is at 105)
+## Status — **165 tests green** (on `feat/map-fusion`; `main` is at 105)
 
 | milestone | state | measured |
 | --- | --- | --- |
@@ -65,6 +102,7 @@ ported unchanged, and one of its headline results did not reproduce (below).
 | **VO poses + lidar fused into an accumulated map** | done — *on the branch* | **1.86× the scene mapped at 5 scans** |
 | **Planner driving the fused map** | done — *on the branch* | **shield still 0 collisions; success −12 to −14 pts** |
 | **Free-space carving + occupied/free/unknown map** | done — *on the branch* | **map-metric non-result, but carving wins +4 pts on the planner; shield 0 collisions on every map (below)** |
+| **Cautious speed cap + unknown hole-closing** | done — *on the branch* | **honest map drivable: hard-block 4% → cap 34–40% success; shield still 0 collisions; corridor 10→21 m** |
 
 Full numbers: `README.md` and `scripts/RESULTS.md`.
 
@@ -293,15 +331,19 @@ Seed spread was small (1.0–2.9 pts), unusually low for deep RL. Sweep cost ~35
   it, and `eval_mapping` cannot credit it (the benefit cancels when both maps are carved). The
   open work is measuring it where it can pay off: the planner, or a drive with real traffic.
   KITTI raw has tracklets for some drives.
-- **The free/unknown distinction is wired but too strict to drive.** `unknown_blocks` now folds
-  the `unknown` mask into the shield and rays (done this session), and it is *sound* — the shield
-  holds 0 collisions on it — but a single-drive map is >50% unknown, so hard blocking is
-  unnavigable (4% success). It needs a **frontier-only / free-for-traversal softening** (only the
-  observed-free→unknown boundary blocks, or unknown is traversable but capped), which is the open
-  design question. Until then `outside_is_free=True` / unknown-as-free stays the operative
-  default. Separately, the largest optimistic (unsafe-direction) excursions are still obstacles
-  near `x_max = 50 m` that drift pushes across the boundary — carving *worsens* them at large
-  windows (+21 m/s at 20 scans), another reason to keep the window short.
+- **The free/unknown distinction is now drivable via the cap (resolved this session), but the
+  cap is one design point, not a swept one.** `unknown_blocks` (hard) is sound but unnavigable
+  (4%); the **cautious speed cap** + **hole-closing** makes it drivable (34–40%) with the shield
+  still at 0 collisions — see the latest-session section. What is *not* done: the cap's knobs are
+  untuned. `cautious_speed_cap` uses a fixed forward cone (`half_cone=0.15`, 3 rays) and
+  `close_unknown=5` cells (1 m) — reasonable, measured once, but not swept. A wider cone is more
+  conservative (sees lateral unknown, caps harder); a bigger close window frees more but risks
+  bridging a thin real occlusion. There may be a few points in tuning these. Also: the cap is
+  only applied in the *env* (`DriveNavEnv.step`), not in `eval_mapping.py`, so the map-permitted-
+  speed sweep still reports the hard/optimistic readings, not the capped one. Separately, the
+  largest optimistic (unsafe-direction) excursions are still obstacles near `x_max = 50 m` that
+  drift pushes across the boundary — carving *worsens* them at large windows (+21 m/s at 20
+  scans), another reason to keep the window short.
 - **The grid cannot certify above 21.2 m/s.** `sqrt(2 · 4.5 · 50)`. Any permitted speed above
   that is `outside_is_free` talking, not the sensor — which is why `eval_mapping.py` caps at 21
   while `render_bev.py` still uses 35. Worth reconciling.
@@ -321,17 +363,16 @@ Seed spread was small (1.0–2.9 pts), unusually low for deep RL. Sweep cost ~35
 
 ## What next — options
 
-**My recommendation: (1) then (2).** Free-space carving *and* the honest-unknown planner
-measurement are both done now (above): carving wins ~4 pts back on the planner, the shield stays
-sound on every map, and hard unknown-blocking is too strict to drive. What is left is making the
-honest reading *usable*, and finding a drive where carving's de-smear can be credited.
+**My recommendation now: (2) then (3).** Carving is built, the honest map is drivable (the cap,
+this session), and the shield is sound on every map. The two things left that would actually move
+the story: measure carving where its de-smear can be *credited* (a drive with traffic), and make
+the safety argument reason about *motion*. Option 1 below is **done** — kept for the record.
 
-1. **Softer unknown semantics, so the honest map is drivable.** Hard `unknown_blocks` is sound
-   but unnavigable (4%). The fix is a **frontier-only** reading (only the observed-free→unknown
-   boundary blocks; deep unknown behind it is not double-counted) or **free-for-traversal-with-a-
-   cap** (unknown is passable but limits speed like a low-confidence region). Both are small
-   changes to `BEVGrid.blocking`/`ray_distances`; `eval_policies.py --carve` already has the
-   harness to score them against the fused and hard-blocking columns.
+1. **✅ DONE — softer unknown semantics, so the honest map is drivable.** The **cautious speed
+   cap** (unknown traversable, speed governed by frontier distance) plus **hole-closing** takes
+   hard-block's 4% to 34–40% with the shield still at 0 collisions. The frontier-only alternative
+   was analysed and rejected (it is a no-op for the shield — see the latest-session notes). What
+   remains is *tuning* the cap's cone/close-window (see known gaps), not designing it.
 2. **A drive with real traffic.** 0009 is too static for carving's de-smear to show in the map
    metric or move the planner much. A drive with moving actors is where "carving forgets a car
    that drove away" becomes a measurable win (and where dynamic obstacles, below, get real).
@@ -369,7 +410,7 @@ honest reading *usable*, and finding a drive where carving's de-smear can be cre
 ## Commands worth knowing
 
 ```bash
-python3 -m pytest tests/ -q                     # 153 green; dataset tests skip without KITTI
+python3 -m pytest tests/ -q                     # 165 green; dataset tests skip without KITTI
 
 # mapping: the sweep behind the accumulated-map table, and the ego self-filter audit
 python3 scripts/eval_mapping.py --sweep 1 2 3 5 10 20 --every 12 --max-speed 21
@@ -381,7 +422,7 @@ python3 scripts/eval_mapping.py --sweep 5 10 20 --every 12 --carve --carve-persi
 
 # policies: prints synthetic + KITTI single-scan + KITTI fused, all three
 python3 scripts/eval_policies.py --episodes 200
-# ...and --carve adds carved + carved+unknown-blocks columns (the planner-on-carved-map table)
+# ...and --carve adds carved / carved+unknown-blocks / carved+cap columns (the drivable honest map)
 python3 scripts/eval_policies.py --episodes 200 --carve --fused-window 5
 
 python3 scripts/eval_odometry.py --plot docs/trajectory.png

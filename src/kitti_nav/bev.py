@@ -189,7 +189,7 @@ class BEVGrid:
 
     def __init__(self, occupancy: np.ndarray, cfg: BEVConfig | None = None,
                  outside_is_free: bool = True, unknown: np.ndarray | None = None,
-                 unknown_blocks: bool = False):
+                 unknown_blocks: bool = False, unknown_speed_cap: bool = False):
         self.cfg = cfg or BEVConfig()
         self.occupancy = np.asarray(occupancy, np.uint8)
         self.outside_is_free = outside_is_free
@@ -210,6 +210,14 @@ class BEVGrid:
         # a cell no ray ever observed is not certified drivable. Only has an effect when an
         # `unknown` mask is present, i.e. on a carved map.
         self.unknown_blocks = bool(unknown_blocks)
+
+        # The softer, drivable reading of an accumulated map's holes: rather than walling the
+        # car out of every unobserved cell (`unknown_blocks`, sound but unnavigable — a single
+        # drive is >50% unknown), let it *traverse* unknown space but cap its speed to what it
+        # could brake out of before the frontier. The collision certificate is untouched — the
+        # shield still runs against occupancy alone; this is a separate governor the env
+        # applies (`nav_env.cautious_speed_cap`). Off by default; only meaningful with a mask.
+        self.unknown_speed_cap = bool(unknown_speed_cap)
 
     @classmethod
     def from_scan(cls, points: np.ndarray, cfg: BEVConfig | None = None,
@@ -247,6 +255,20 @@ class BEVGrid:
         """
         occ = self.occupancy.astype(bool)
         if self.unknown_blocks and self.unknown is not None:
+            return occ | self.unknown
+        return occ
+
+    @cached_property
+    def cautious_blocking(self) -> np.ndarray:
+        """Cells that are **not** confidently observed clear: occupied plus unknown.
+
+        Unlike `blocking` this ignores the `unknown_blocks` flag — it is the edge of
+        trustworthy free space regardless of how the shield treats unknown, and it is what the
+        speed governor (`confident_clear_distance`) measures against. On an un-carved binary
+        map (no `unknown` mask) it collapses to `occupancy`.
+        """
+        occ = self.occupancy.astype(bool)
+        if self.unknown is not None:
             return occ | self.unknown
         return occ
 
@@ -313,10 +335,21 @@ class BEVGrid:
         unknown cells (on a carved map) stop a ray the same way when `unknown_blocks` is set,
         so the policy sees an occlusion shadow as a wall rather than driving into it.
         """
+        dirs = yaw + np.asarray(angles, float).reshape(-1)            # (R,)
+        return self._march_to(self.blocking, origin, dirs, max_range, outside_blocks)
+
+    def _march_to(self, blocking: np.ndarray, origin: np.ndarray, dirs: np.ndarray,
+                  max_range: float, outside_blocks: bool) -> np.ndarray:
+        """Ray-march a fan of absolute-heading rays `dirs` against a `blocking` mask.
+
+        Shared by `ray_distances` (against `self.blocking`) and `confident_clear_distance`
+        (against `self.cautious_blocking`), so the two see obstacles at exactly the same grid
+        samples. Steps at half a cell — Nyquist on the raster, no cell skipped — and returns
+        the free distance (m) to the first blocked sample per ray, `max_range` if none.
+        """
         rows, cols = self.cfg.shape
         step = self.cfg.resolution * 0.5
         t = np.arange(0.0, max_range + step, step)                    # (S,)
-        dirs = yaw + np.asarray(angles, float).reshape(-1)            # (R,)
 
         px = origin[0] + np.cos(dirs)[:, None] * t[None, :]           # (R, S)
         py = origin[1] + np.sin(dirs)[:, None] * t[None, :]
@@ -326,7 +359,7 @@ class BEVGrid:
         inside = (r >= 0) & (r < rows) & (c >= 0) & (c < cols)
 
         blocked = np.zeros(px.shape, bool)
-        blocked[inside] = self.blocking[r[inside], c[inside]]
+        blocked[inside] = blocking[r[inside], c[inside]]
         if outside_blocks:
             blocked |= ~inside
 
@@ -334,6 +367,23 @@ class BEVGrid:
         any_hit = blocked.any(axis=1)
         first = np.where(any_hit, blocked.argmax(axis=1), len(t) - 1)
         return np.minimum(t[first], max_range)
+
+    def confident_clear_distance(self, origin: np.ndarray, yaw: float,
+                                 angles: np.ndarray | None = None,
+                                 max_range: float = 30.0) -> np.ndarray:
+        """Distance (m) ahead to the edge of confidently-free space along each heading.
+
+        The nearest occupied *or* unknown cell (or the grid edge) along `yaw + angles`, using
+        `cautious_blocking` — so it reports how far the sensor-confirmed clear corridor
+        actually extends, independent of the `unknown_blocks` shield flag. The speed governor
+        turns this into a cap: never travel faster than you could brake within it, so the car
+        never enters unmapped space faster than it could halt at its threshold.
+        """
+        if angles is None:
+            angles = np.zeros(1)
+        dirs = yaw + np.asarray(angles, float).reshape(-1)
+        return self._march_to(self.cautious_blocking, origin, dirs, max_range,
+                              outside_blocks=True)
 
     def covers_stopping_distance(self, distance: float) -> bool:
         """Does the grid extend far enough ahead to certify a stop of `distance` metres?

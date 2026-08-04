@@ -64,16 +64,22 @@ def scene_sources(args):
         if w > 1:
             sources[f"KITTI (fused, {w} scans)"] = lambda: KittiScenes(
                 drive=drive, map_config=MapConfig(window=w))
-            # Free-space carving, two ways: with unknown cells assumed free (isolates what
-            # carving's obstacle removal does to the planner) and with unknown cells blocking
-            # (adds the honest reading that unobserved space is not certified drivable). The
-            # gap between the two is the price of that honesty.
+            # Free-space carving, three ways: unknown assumed free (isolates what carving's
+            # obstacle removal does to the planner); unknown hard-blocking (the honest but
+            # unnavigable reading — unobserved space is not certified drivable); and unknown
+            # traversable-but-speed-capped (the drivable honesty — the car may cross unmapped
+            # cells but never faster than it could brake out of at the frontier). The gap
+            # between the three is the price, and the recovery, of that honesty.
             if args.carve:
                 sources[f"KITTI (carved, {w} scans)"] = lambda: KittiScenes(
                     drive=drive, map_config=MapConfig(window=w, carve=True))
                 sources[f"KITTI (carved+unknown, {w} scans)"] = lambda: KittiScenes(
                     drive=drive, map_config=MapConfig(window=w, carve=True),
                     unknown_blocks=True)
+                sources[f"KITTI (carved+cap, {w} scans)"] = lambda: KittiScenes(
+                    drive=drive,
+                    map_config=MapConfig(window=w, carve=True, close_unknown=5),
+                    unknown_speed_cap=True)
     return sources
 
 
@@ -88,7 +94,8 @@ def main() -> int:
     p.add_argument("--fused-window", type=int, default=5,
                    help="scans fused for the accumulated-map column; 1 disables it")
     p.add_argument("--carve", action="store_true",
-                   help="add free-space-carved KITTI columns (unknown free, then blocking)")
+                   help="add free-space-carved KITTI columns (unknown free, hard-blocking, "
+                        "then traversable-but-speed-capped)")
     args = p.parse_args()
 
     base = DriveNavConfig()

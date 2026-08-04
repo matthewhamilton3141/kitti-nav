@@ -27,6 +27,7 @@ from kitti_nav.mapping import (
     FusedMap,
     MapConfig,
     ScanAccumulator,
+    _close_unknown_holes,
     drop_ego_returns,
     fuse_map,
     fuse_scans,
@@ -492,6 +493,54 @@ def test_carving_marks_never_seen_cells_unknown_not_free():
     # The three classes partition the grid exactly.
     assert (carved.occupied.astype(bool) | carved.free | carved.unknown).all()
     assert not (carved.free & carved.unknown).any()
+
+
+def test_close_unknown_fills_enclosed_holes_not_open_occlusion():
+    """The morphology's selectivity: a ring-gap speckle closes; an occlusion shadow does not."""
+    observed = np.ones((40, 40), bool)
+    observed[10, 10] = False                             # a 1-cell enclosed hole (ring gap)
+    observed[20:35, 20:38] = False                       # a large region open to the edge
+    observed[20:35, 38:] = False                         # ...contiguous with the beyond-range void
+
+    closed = _close_unknown_holes(observed, window=5)
+    assert closed[10, 10]                                # the enclosed speckle is filled
+    assert not closed[27, 28]                            # the open occlusion shadow is not
+    assert (closed >= observed).all()                    # closing only ever adds observed cells
+
+
+def test_close_unknown_reclassifies_speckles_without_touching_occupancy():
+    """Through `fuse_map`: hole-closing frees enclosed unknown cells, occupied is untouched."""
+    world = np.concatenate([road(), wall(22.0, -4.0, 4.0)])
+    rigs = [se3(x=0.5 * i) for i in range(5)]
+    scans = [observe(world, r) for r in rigs]
+    poses = [cam_pose(r) for r in rigs]
+
+    raw = fuse_map(scans, poses, T_CAM_VELO, cfg=MapConfig(carve=True))
+    closed = fuse_map(scans, poses, T_CAM_VELO, cfg=MapConfig(carve=True, close_unknown=5))
+
+    assert np.array_equal(raw.occupied, closed.occupied)         # occupancy never changes
+    assert closed.unknown.sum() < raw.unknown.sum()              # some unknown became free
+    assert (closed.free >= raw.free).all()                       # only ever unknown -> free
+    # The three classes still partition the grid exactly.
+    assert (closed.occupied.astype(bool) | closed.free | closed.unknown).all()
+    assert not (closed.free & closed.unknown).any()
+
+
+def test_close_unknown_off_reproduces_the_raw_carved_map():
+    """Reproducibility: the default (0) leaves the carved classification bit-for-bit unchanged."""
+    world = np.concatenate([road(), wall(20.0, -5.0, 5.0)])
+    rigs = [se3(x=0.4 * i) for i in range(4)]
+    scans = [observe(world, r) for r in rigs]
+    poses = [cam_pose(r) for r in rigs]
+
+    a = fuse_map(scans, poses, T_CAM_VELO, cfg=MapConfig(carve=True))
+    b = fuse_map(scans, poses, T_CAM_VELO, cfg=MapConfig(carve=True, close_unknown=0))
+    assert np.array_equal(a.unknown, b.unknown) and np.array_equal(a.free, b.free)
+
+
+def test_close_unknown_rejects_a_negative_window():
+    with pytest.raises(ValueError):
+        MapConfig(close_unknown=-1)
 
 
 def test_carving_flows_through_the_accumulator_grid():

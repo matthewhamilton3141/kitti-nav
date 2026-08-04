@@ -268,20 +268,22 @@ scans), dominated by the march.
 ### The planner on a carved map (200 episodes)
 
 The map-fidelity metric could not credit carving, so the other place it can show is the
-planner. Every policy is the same synthetic-trained one, evaluated on three versions of the
+planner. Every policy is the same synthetic-trained one, evaluated on four versions of the
 five-scan real map: fused (the accumulated map, unknown assumed free), carved (see-through
-cells retired), and carved with an **honest** occupied/free/unknown reading where a cell no ray
-ever observed is treated as an obstacle for both the shield and the policy's rays.
+cells retired), carved with a **hard** occupied/free/unknown reading where a cell no ray ever
+observed is an obstacle for the shield and the rays, and carved with the **cap** reading —
+unknown is traversable but the car's speed is governed by how far confidently-free space
+reaches ahead, so it never enters unmapped space faster than it could brake out of.
 
-| policy | fused (5) | carved (5) | carved + unknown-blocks |
-| --- | --- | --- | --- |
-| gap-following | 59% / 82 coll | 60% / 79 | 4% / 192 |
-| gap-following + shield | 54% / **0** | 56% / **0** | 4% / **0** |
-| PPO (raw) | 66% / 67 | **70% / 60** | 4% / 172 |
-| PPO (raw) + shield at eval | 62% / **0** | 62% / **0** | 4% / **0** |
-| PPO through shield | 64% / **0** | 66% / **0** | 4% / **0** |
+| policy | fused (5) | carved (5) | carved + unknown-blocks | carved + cap |
+| --- | --- | --- | --- | --- |
+| gap-following | 59% / 82 coll | 60% / 79 | 4% / 192 | 40% / 63 |
+| gap-following + shield | 54% / **0** | 56% / **0** | 4% / **0** | 37% / **0** |
+| PPO (raw) | 66% / 67 | **70% / 60** | 4% / 172 | 39% / 32 |
+| PPO (raw) + shield at eval | 62% / **0** | 62% / **0** | 4% / **0** | 34% / **0** |
+| PPO through shield | 64% / **0** | 66% / **0** | 4% / **0** | 36% / **0** |
 
-Three things, in order of how much they matter:
+Four things, in order of how much they matter:
 
 - **The shield holds 0 collisions in every column**, including the degenerate one where the map
   is majority-obstacle and the car can barely move. This is the strongest form of the repo's
@@ -301,9 +303,25 @@ Three things, in order of how much they matter:
   return as observed, and exempting the lidar's ~4 m near-field ground blind spot (a roof lidar
   cannot see the road directly under the car; real stacks assume it is drivable) — and even then
   the through-path is walled. The honest reading is *sound* (the shield never lies) but too
-  strict to *drive*: it wants a frontier-only or free-for-traversal softening, which is the next
-  question. This is why `outside_is_free`/unknown-as-free is the pragmatic default, now with a
-  measured reason rather than an assumption.
+  strict to *drive*.
+- **The cap reading makes the honest map drivable — 4% → ~37% — with the shield still sound.**
+  This is the payoff. Rather than walling the car out of unknown space, the cap lets it *cross*
+  unmapped cells but governs its speed by the frontier distance (`v ≤ sqrt(2·a·d)`, the inverse
+  of the stopping distance), so it never enters the unknown faster than it could halt at its
+  threshold — a governor layered on the collision shield, which is untouched and stays at **0
+  collisions on every shielded row**. Two things had to be true for this to work and both are
+  measured: (1) collision stays a function of *occupancy alone*, so unknown hugging a corridor
+  no longer puts the car's own footprint in collision the way hard-blocking does — that alone
+  drops unshielded collisions 5–11× vs the hard column (gap 192 → 63, PPO 172 → 32); and (2) the
+  confidently-free corridor has to actually reach the goal, which raw carving does not — a
+  single drive's observed road is speckled with unknown between lidar rings, so the corridor
+  reaches only a median 10 m. **Closing those enclosed holes** (`MapConfig.close_unknown`, a
+  morphological close that fills unknown cells surrounded by observed road but leaves a genuine
+  occlusion shadow open) doubles it to a median 21 m, into goal range, without touching
+  occupied cells. The remaining gap to unknown-as-free (60–70%) is not a defect — it is the
+  honest price of respecting unobserved space instead of assuming it clear, now measured rather
+  than assumed. `outside_is_free` remains the optimistic default; the cap is the drivable
+  *honest* one.
 
 ## Reproduce
 
