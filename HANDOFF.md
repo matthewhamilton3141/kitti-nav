@@ -5,18 +5,22 @@ notes — what was decided and why, what broke, and what is actually left.
 
 ## ⚠ Read first: the tree is not where you'd assume
 
-**Work is on `feat/map-fusion`, two commits, pushed, and NOT merged to `main`.**
+**All the mapping/carving work is on `feat/map-fusion`, pushed, and NOT merged to `main`.**
 
 ```
-feat/map-fusion  9083033  feat: let the planner drive the accumulated map
+feat/map-fusion  a289ebe  feat: honest unknown-blocks semantics + carved-map planner measurement
+                 8515611  feat: height-aware free-space carving + occupied/free/unknown map
+                 e01bb73  docs: bring the handoff current
+                 9083033  feat: let the planner drive the accumulated map
                  db410e3  feat: fuse VO poses + lidar into an accumulated BEV map
-main             02a1098  ← still the previous session's tip
+main             02a1098  ← still the previous session's tip, five commits behind
 ```
 
-Working tree clean, branch in sync with `origin`. **A decision is pending and was left to the
-user:** fast-forward `main` (`git checkout main && git merge --ff-only feat/map-fusion &&
-git push`) or open the repo's first PR. Nothing else is blocked on it — just don't assume
-`main` has any of the mapping work, and don't re-do it because `git log main` looks stale.
+Working tree clean, branch in sync with `origin/feat/map-fusion`. **A decision is still
+pending and was left to the user:** fast-forward `main` (`git checkout main && git merge
+--ff-only feat/map-fusion && git push`) or open the repo's first PR. Nothing is blocked on it —
+just don't assume `main` has any of the fusion/carving work, and don't re-do it because
+`git log main` looks stale.
 
 This also breaks the repo's prior convention of committing straight to `main`; the branch was
 used because the change is large. Either resolution is fine, but pick one before adding more.
