@@ -3,6 +3,93 @@
 Plain-English "pick up here." The README is the polished public account; this is the working
 notes — what was decided and why, what broke, and what is actually left.
 
+---
+
+# ▶ START HERE — next step for a cleared session
+
+**Where things stand.** Branch `feat/map-fusion`, clean, in sync with origin, **186 tests green**
+(`python3 -m pytest tests/ -q`; dataset tests skip without KITTI). Latest four commits, newest
+first:
+
+```
+18ada5e feat: dynamic shield — braking for where a moving obstacle is going (stage 2)
+ff5c2c0 feat: label-free BEV obstacle-velocity estimation (stage 1)
+b5cc275 feat: object tracklets, and free-space carving credited by labels
+3f5d75d feat: cautious speed cap makes the honest unknown map drivable
+```
+
+Everything below the `▶` block is the deep record (four session write-ups, then decisions, bugs,
+gaps, env facts). Read this block, then dip into those as needed — they are accurate and current.
+
+**Still pending (unchanged all session): `main` is 9 commits behind and none of this is merged.**
+Decide fast-forward vs first PR before adding more — see "⚠ Read first" further down. Not blocking.
+
+## The next step: a closed-loop dynamic env (option 3a)
+
+The dynamic shield (`dynamics.dynamic_safety_shield`) is built, tested, and measured *open-loop*
+(a synthetic crossing test + a permitted-speed comparison on real 0009 movers). What is missing
+to make it a headline like the static shield's "0 collisions" table is a **closed-loop dynamic
+environment**: obstacles that actually *move* while a policy drives, so `evaluate` can report
+success / collisions with the **static shield vs the dynamic shield** on moving traffic.
+
+**Why this is the right next step:** it turns the open-loop 8%-of-frames result into an end-to-end
+safety claim ("the dynamic shield admits collisions the static one does not, and eliminates them")
+— the moving-world analogue of the repo's central static-shield result. All primitives exist; this
+is wiring, an eval, and tests, not new theory.
+
+### Build plan (concrete)
+
+1. **`DynamicScene`** (in `nav_env.py`, next to `Scene`): a static background grid **with movers
+   removed** + a list of `dynamics.MovingObstacle` (initial box + constant velocity) + `start` +
+   `goal`. Movers travel at constant velocity for the episode — matches the shield's model and is
+   cleaner than replaying the recorded path.
+2. **Dynamic env** — either a `DynamicNavEnv` or a branch inside `DriveNavEnv.step`:
+   - track sim time; each `step` advances every mover to `box_at(step * dt)`;
+   - the **collision check** and **both shields** must see the *same* obstacle set = static grid
+     ∪ current mover boxes. `dynamics.BoxField(boxes)` already wraps oriented boxes as an
+     `ObstacleField`, so static-shield-vs-movers is `safety_shield(…, BoxField(static_and_movers))`;
+     dynamic is `dynamic_safety_shield(accel, steer, state, static_field, movers_now, cfg)`.
+   - `certifiable_start` must use the field at t=0.
+3. **Scene source `KittiDynamicScenes`**: pick 0009 frames where a mover crosses the ego's forward
+   corridor (the interacting 8% — filter like `eval_dynamic_shield.py` does, `box[0] > ego.x` and
+   heading across). Build static occupancy with the mover lifted out (`occ & ~rasterize_box`),
+   seed the `MovingObstacle` from the tracklet's frame velocity (`_actor_velocity` in
+   `eval_dynamic_shield.py`), place ego at `vehicle_state_in_lidar`, goal ahead.
+4. **`scripts/eval_dynamic_policies.py`**: gap-following / PPO under static shield vs dynamic
+   shield across the dynamic scenes; print success / collisions. **Expected result:** the static
+   shield admits collisions with crossing cars; the dynamic shield drives them toward 0 (to the
+   extent the constant-velocity prediction holds).
+5. **Tests** (`test_nav_env.py` or `test_dynamics.py`): a `DynamicScene` episode where a crossing
+   mover collides the static-shielded run but not the dynamic-shielded one — the closed-loop
+   version of `test_static_shield_hits_a_crossing_car_that_the_dynamic_shield_avoids`.
+
+### Gotchas / decisions already made (do not re-litigate)
+
+- **Feed the shield from tracklet motion, not label-free.** Stage 1's label-free velocity is
+  ~95% false-positive (aspect-change parallax on parked cars — 0009 has 89); it would have the
+  shield braking for phantoms everywhere. Measured, not assumed. Label-free is the perception gap,
+  not the feed. (Details in the dynamic-obstacles session note below.)
+- **Constant-velocity reachable set** (time-indexed, not swept-union). The shield's guarantee is
+  sound *relative to that prediction*; an obstacle predicted to cut in trips `ics`. That is the
+  honest scope — state it, don't hide it.
+- **Frames are in the velodyne frame**; tracklet poses are native to it, so boxes drop into the
+  BEV with no transform. Ego (rear axle) is at `drive.vehicle_state_in_lidar()`, driving +x.
+- Reuse, don't rebuild: `dynamics.{MovingObstacle,BoxField,dynamic_safety_shield,
+  can_stop_safely_dynamic,max_safe_speed_dynamic,point_box_distance}`, `bev.rasterize_box`,
+  `kitti.KittiDrive.{moving_tracklets,tracklet_boxes}`, and `eval_dynamic_shield.py`'s
+  `_actor_velocity` helper (worth promoting into `kitti.py` if reused).
+
+### Fast reproduce of the current state
+
+```bash
+python3 -m pytest tests/ -q                              # 186 green
+python3 scripts/fetch_kitti.py --tracklets               # tiny; labels for 0009 (drive already on disk)
+python3 scripts/eval_dynamic_shield.py                   # static vs dynamic permitted speed, 0009 movers
+python3 scripts/eval_dynamics.py --window 4 --coherence 0.8 --min-speed 1.5   # the 95%-FP perception wall
+```
+
+---
+
 ## Latest session (2026-08-04, second sitting): the honest map is drivable now
 
 Option 1 from the previous handoff — "softer unknown semantics, so the honest map is
