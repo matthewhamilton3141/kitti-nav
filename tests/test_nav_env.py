@@ -9,9 +9,13 @@ import pytest
 from dataclasses import replace
 
 from kitti_nav.bev import BEVConfig, BEVGrid
+from kitti_nav.dynamics import MovingObstacle
 from kitti_nav.nav_env import (
     DriveNavConfig,
     DriveNavEnv,
+    DynamicNavConfig,
+    DynamicNavEnv,
+    DynamicScene,
     Scene,
     SyntheticScenes,
     cautious_speed_cap,
@@ -356,6 +360,96 @@ def test_cautious_speed_cap_is_max_speed_where_the_way_ahead_is_confidently_clea
     unknown = np.zeros(bev.shape, bool)                 # nothing unobserved ahead
     grid = BEVGrid(np.zeros(bev.shape, np.uint8), bev, unknown=unknown, unknown_speed_cap=True)
     assert cautious_speed_cap(VehicleState(v=5.0), grid, vcfg) == vcfg.max_speed
+
+
+# --- closed-loop dynamic environment -----------------------------------------------------------
+
+def crossing_scene(mover_vy=4.0, ego_speed=9.0, background=None):
+    """An empty (or given) background with one car sweeping +y across the lane 20 m ahead.
+
+    Timed like the `test_dynamics` crossing test: the car starts off to the right and crosses
+    into the ego's straight-ahead path just as the ego arrives, so a shield that sees only its
+    current (off-path) position brakes too late.
+    """
+    bev = BEVConfig()
+    occ = np.zeros(bev.shape, np.uint8) if background is None else background
+    mover = MovingObstacle(np.array([20.0, -9.0, np.pi / 2, 4.0, 2.0]),
+                           np.array([0.0, mover_vy]))
+    start = VehicleState(x=0.0, y=0.0, yaw=0.0, v=ego_speed)
+    return DynamicScene(BEVGrid(occ, bev), [mover], start, np.array([32.0, 0.0]))
+
+
+def _drive_straight(env, throttle=1.0):
+    """Full-throttle straight run; returns the final info dict."""
+    env.reset(0)
+    info = {}
+    for _ in range(env.cfg.max_steps):
+        _, _, terminated, truncated, info = env.step(np.array([throttle, 0.0]))
+        if terminated or truncated:
+            break
+    return info
+
+
+def test_static_shield_drives_into_a_crossing_mover_the_dynamic_shield_stops_for():
+    """The closed-loop headline: the moving-world analogue of the "0 collisions" result.
+
+    Same scene, same policy (drive straight), differing only in which shield filters the
+    action. The static shield sees the crossing car only once it is already in the lane —
+    too late — and drives into it; the dynamic shield brakes for where the car *will be* and
+    lets it pass. This is `test_dynamics`'s open-loop crossing demonstration closed into a
+    full episode with the environment stepping the obstacle.
+    """
+    src = FixedScene(crossing_scene())
+    static = _drive_straight(DynamicNavEnv(src, DynamicNavConfig(use_shield=True)))
+    dynamic = _drive_straight(
+        DynamicNavEnv(src, DynamicNavConfig(use_shield=True, dynamic_shield=True)))
+    assert static["hit_mover"], "the static shield should have driven into the crossing car"
+    assert not dynamic["collided"], "the dynamic shield should have braked for it"
+    assert dynamic["reached"], "and then reached the goal once the car had passed"
+
+
+def test_a_dynamic_shield_collision_is_always_an_inevitable_collision_state():
+    """Soundness in the moving world: the dynamic shield never *drives* into a mover.
+
+    A car sweeping straight into the ego from close range is unavoidable — but the shield must
+    brake and flag it, not silently admit it. Any collision it does suffer is a mover reaching
+    a stopping envelope it could not escape, so `ics` is set: the analogue of the static
+    shield's guarantee that its only collisions are inevitable-collision starts.
+    """
+    bev = BEVConfig()
+    mover = MovingObstacle(np.array([8.0, -3.0, np.pi / 2, 4.0, 2.0]), np.array([0.0, 6.0]))
+    scene = DynamicScene(BEVGrid(np.zeros(bev.shape, np.uint8), bev), [mover],
+                         VehicleState(x=0.0, y=0.0, yaw=0.0, v=10.0), np.array([32.0, 0.0]))
+    env = DynamicNavEnv(FixedScene(scene), DynamicNavConfig(use_shield=True, dynamic_shield=True))
+    info = _drive_straight(env)
+    if info["collided"]:
+        assert env.last_shield.ics, "a dynamic-shield collision must be an ICS, never a silent hit"
+
+
+def test_dynamic_env_advances_the_mover_each_step():
+    """Mechanics: the obstacle really moves, so the grid the policy reads changes with time."""
+    env = DynamicNavEnv(FixedScene(crossing_scene()),
+                        DynamicNavConfig(use_shield=False))
+    env.reset(0)
+    before = int(env.grid.occupancy.sum())
+    cells_before = env.grid.occupancy.copy()
+    for _ in range(5):
+        env.step(np.array([0.0, 0.0]))
+    # The footprint is still on the grid (same cell count, box just translated) but in new cells.
+    assert int(env.grid.occupancy.sum()) == pytest.approx(before, abs=6)
+    assert not np.array_equal(env.grid.occupancy, cells_before), "the mover did not move"
+
+
+def test_dynamic_env_with_no_movers_matches_a_static_drive():
+    """With an empty mover list the dynamic env is just a static drive across `static_grid`."""
+    bev = BEVConfig()
+    scene = DynamicScene(BEVGrid(np.zeros(bev.shape, np.uint8), bev), [],
+                         VehicleState(x=0.0, y=0.0, yaw=0.0, v=5.0), np.array([30.0, 0.0]))
+    env = DynamicNavEnv(FixedScene(scene), DynamicNavConfig(use_shield=False))
+    info = _drive_straight(env)
+    assert info["reached"] and not info["collided"]
+    assert np.array_equal(env.grid.occupancy, scene.static_grid.occupancy)
+    assert info["hit_mover"] is False
 
 
 # --- Gymnasium wrapper -------------------------------------------------------------------------

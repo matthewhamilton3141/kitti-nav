@@ -324,3 +324,26 @@ class KittiDrive:
     def moving_tracklets(self, min_disp: float = 2.0) -> list[Tracklet]:
         """The genuinely-moving subset of `tracklets` (world displacement over `min_disp` m)."""
         return [t for t in self.tracklets if self.is_moving(t, min_disp)]
+
+    def actor_velocity(self, t: Tracklet, frame: int,
+                       dt: float = 0.1) -> Optional[np.ndarray]:
+        """Tracklet `t`'s velocity `(vx, vy)` in `frame`'s velo frame, or None if unavailable.
+
+        The velo-frame centre at `frame` minus the previous frame's centre brought into this
+        frame through the ego motion — so the ego's own translation is removed and what remains
+        is the actor's frame-local constant velocity, the feed the dynamic shield's reachable
+        set consumes (`dynamics.MovingObstacle`). Returns None when either frame is outside the
+        tracklet's span. Uses ground-truth poses; the within-frame ego displacement is what
+        matters here, not global drift.
+        """
+        from .mapping import relative_lidar_transform, transform_points
+
+        if t.index_of(frame) is None or t.index_of(frame - 1) is None:
+            return None
+        Tcv = self.T_cam2_velo
+        cf = t.box_at(frame)[:2]
+        kprev = t.index_of(frame - 1)
+        prev3 = np.array([[t.tx[kprev], t.ty[kprev], t.tz[kprev]]])
+        T = relative_lidar_transform(self.gt_poses[frame], self.gt_poses[frame - 1], Tcv)
+        cprev = transform_points(prev3, T)[0, :2]
+        return (cf - cprev) / dt

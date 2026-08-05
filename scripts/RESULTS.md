@@ -433,12 +433,48 @@ a safety error.
 
 Reproduce: `python3 scripts/eval_dynamic_shield.py`.
 
+### Closed-loop dynamic traffic — the moving-world "0 collisions" table
+
+The permitted-speed comparison is open-loop (one decision at the ego's true pose). The
+end-to-end claim needs obstacles that *move while a policy drives*. `nav_env.DynamicNavEnv`
+steps every `MovingObstacle` along its velocity each control step, so the collision check and
+both shields see one obstacle set — static geometry ∪ the movers where they are this step.
+`nav_env.KittiDynamicScenes` mines drive 0009 for the **91 crossing encounters** (a labelled
+mover crossing *into* the ego's forward corridor), lifts the actor out of the frozen scan, and
+re-inserts it as a constant-velocity box seeded from its tracklet motion. Gap-following then
+drives to a goal ahead under each shield, 200 episodes:
+
+| gap-following | success | collisions | mover-collisions | drove in | run into |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| unshielded | 70/200 | 134 | 46 | **46** | 0 |
+| static shield | 91/200 | 59 | 51 | **51** | 0 |
+| dynamic shield | 90/200 | 46 | 34 | **4** | 30 |
+
+The headline is the split of *how* a mover-collision happens, by the ego's speed at impact.
+**"Drove in"** (ego still moving) is the shield steering the car into the crossing mover — the
+static shield does this **51 times**, because it brakes only once the car is already in the lane.
+The dynamic shield cuts that to **4**. **"Run into"** (ego stopped) is the mover driving into an
+ego that had already braked to a halt clear of its predicted path — unavoidable by braking, and
+the dynamic shield's residual 30 are all of this kind. Every one of the dynamic shield's 34
+collisions is `ics`-flagged: it never silently drives into a car it could have stopped for, the
+moving-world analogue of the static shield's "its only collisions are inevitable-collision
+starts". (The static shield's mover-collisions edge *up* vs unshielded, 46→51, because it
+prevents the static-geometry crashes that were ending those episodes earlier, so more of them
+survive to the crossing — where, being static-only, it then drives in.)
+
+The four residual "drove in" under the dynamic shield are ICS-while-moving: a car whose
+constant-velocity path cuts inside the stopping envelope faster than any brake escapes — the
+documented scope of a behaviour-predicting shield, not a soundness hole.
+
+Reproduce: `python3 scripts/eval_dynamic_policies.py --episodes 200`.
+
 ## Reproduce
 
 ```bash
 # label-free obstacle velocity, graded against tracklets; then the dynamic shield vs static
 python3 scripts/eval_dynamics.py --window 4 --coherence 0.8 --min-speed 1.5
 python3 scripts/eval_dynamic_shield.py
+python3 scripts/eval_dynamic_policies.py --episodes 200   # closed-loop: static vs dynamic shield
 
 # accumulated mapping (the table above; --audit-ego re-derives the self-filter box)
 python3 scripts/eval_mapping.py --sweep 1 2 3 5 10 20 --every 12 --max-speed 21

@@ -35,28 +35,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from kitti_nav.bev import BEVConfig, BEVGrid, occupancy_from_scan, rasterize_box
 from kitti_nav.dynamics import MovingObstacle, max_safe_speed_dynamic
 from kitti_nav.kitti import KittiDrive
-from kitti_nav.mapping import (
-    KITTI_EGO_BOX,
-    drop_ego_returns,
-    relative_lidar_transform,
-    transform_points,
-)
+from kitti_nav.mapping import KITTI_EGO_BOX, drop_ego_returns
 from kitti_nav.vehicle import VehicleConfig, max_safe_speed
-
-DT = 0.1
-
-
-def _actor_velocity(drive: KittiDrive, t, f: int) -> np.ndarray | None:
-    """Tracklet `t`'s velocity `(vx, vy)` in frame `f`'s velo frame, or None if unavailable."""
-    if t.index_of(f) is None or t.index_of(f - 1) is None:
-        return None
-    Tcv = drive.T_cam2_velo
-    cf = t.box_at(f)[:2]
-    kprev = t.index_of(f - 1)
-    prev3 = np.array([[t.tx[kprev], t.ty[kprev], t.tz[kprev]]])
-    T = relative_lidar_transform(drive.gt_poses[f], drive.gt_poses[f - 1], Tcv)
-    cprev = transform_points(prev3, T)[0, :2]
-    return (cf - cprev) / DT
 
 
 def main() -> int:
@@ -85,7 +65,7 @@ def main() -> int:
                 continue
             if args.forward_only and box[0] < ego.x:
                 continue
-            vel = _actor_velocity(drive, t, f)
+            vel = drive.actor_velocity(t, f)
             if vel is None:
                 continue
 

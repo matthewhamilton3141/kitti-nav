@@ -28,8 +28,9 @@ Runs entirely on a laptop — pure NumPy + OpenCV, no GPU, no simulator install.
 | Cautious speed cap on unknown space | done — **honest map drivable: 4% → ~37% success, shield still 0 collisions** |
 | Object tracklets crediting carving | done — **0009 has 12 real movers; carving retires 9% of trail, keeps 96% of the actor** |
 | Dynamic shield (braking for a moving obstacle's path) | done — **static shield crashes a crossing car it stops clear of; binds on 8% of real mover-frames** |
+| Closed-loop dynamic traffic (movers step while a policy drives) | done — **on 0009's crossing cars the static shield drives in 51×, the dynamic shield 4×; its residual hits are movers striking a stopped ego, all ics-flagged** |
 
-**186 tests pass.** Dataset-backed tests skip cleanly when KITTI isn't downloaded; the
+**190 tests pass.** Dataset-backed tests skip cleanly when KITTI isn't downloaded; the
 environment core is pure NumPy and tests without any RL stack installed.
 
 ## Quickstart
@@ -142,6 +143,21 @@ steering sensibly. It is the argument for property-based testing in one bug.
 never searches for an *evasive* one, so it brakes for obstacles it might have swerved around.
 The footprint is a conservative disc cover, which inflates the car ~0.12 m per side and ~0.55 m
 past each bumper.
+
+### Reasoning about motion
+
+The static shield treats every obstacle as frozen, which is a safety error when the world moves.
+`dynamics.dynamic_safety_shield` **time-indexes** the same braking rollout: through the stop, the
+obstacles advance along their velocity, so the certificate becomes "can I stop clear of where the
+car *will be*." `nav_env.DynamicNavEnv` closes this into a full episode — obstacles step while a
+policy drives — and `KittiDynamicScenes` mines drive 0009 for the 91 frames where a labelled car
+crosses into the ego's path. Across 200 episodes there, the **static shield drives into a crossing
+car 51 times; the dynamic shield, 4** — and its residual collisions are movers striking an ego
+that had already braked to a stop (unavoidable by braking, all `ics`-flagged, never a silent
+hit). This is the moving-world analogue of the static shield's zero-collision guarantee, sound to
+the extent the constant-velocity prediction holds. Velocity is fed from the object tracklets, not
+label-free estimation — which is ~95% false-positive on parked cars, a measured perception wall
+([`scripts/RESULTS.md`](scripts/RESULTS.md)).
 
 ---
 

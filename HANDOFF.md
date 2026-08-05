@@ -7,9 +7,13 @@ notes — what was decided and why, what broke, and what is actually left.
 
 # ▶ START HERE — next step for a cleared session
 
-**Where things stand.** Branch `feat/map-fusion`, clean, in sync with origin, **186 tests green**
-(`python3 -m pytest tests/ -q`; dataset tests skip without KITTI). Latest four commits, newest
-first:
+**Where things stand.** Branch `feat/map-fusion`, **190 tests green**
+(`python3 -m pytest tests/ -q`; dataset tests skip without KITTI). The **closed-loop dynamic env
+(option 3a) is DONE** — see the session note directly below this block. That work is **not yet
+committed**: the working tree has changes to `nav_env.py`, `kitti.py`, `test_nav_env.py`,
+`eval_dynamic_shield.py`, plus a new `scripts/eval_dynamic_policies.py` and doc updates
+(README / RESULTS / this file). Committing is the first action for whoever picks this up (the
+user hadn't asked yet). Last four *committed* commits, newest first:
 
 ```
 18ada5e feat: dynamic shield — braking for where a moving obstacle is going (stage 2)
@@ -18,74 +22,74 @@ b5cc275 feat: object tracklets, and free-space carving credited by labels
 3f5d75d feat: cautious speed cap makes the honest unknown map drivable
 ```
 
-Everything below the `▶` block is the deep record (four session write-ups, then decisions, bugs,
+Everything below the `▶` block is the deep record (session write-ups, then decisions, bugs,
 gaps, env facts). Read this block, then dip into those as needed — they are accurate and current.
 
-**Still pending (unchanged all session): `main` is 9 commits behind and none of this is merged.**
+**Still pending (unchanged all session): `main` is 9+ commits behind and none of this is merged.**
 Decide fast-forward vs first PR before adding more — see "⚠ Read first" further down. Not blocking.
 
-## The next step: a closed-loop dynamic env (option 3a)
+## ✅ DONE this session: the closed-loop dynamic env (option 3a)
 
-The dynamic shield (`dynamics.dynamic_safety_shield`) is built, tested, and measured *open-loop*
-(a synthetic crossing test + a permitted-speed comparison on real 0009 movers). What is missing
-to make it a headline like the static shield's "0 collisions" table is a **closed-loop dynamic
-environment**: obstacles that actually *move* while a policy drives, so `evaluate` can report
-success / collisions with the **static shield vs the dynamic shield** on moving traffic.
+The dynamic shield was measured open-loop; it now has its **end-to-end moving-world table**, the
+analogue of the static shield's "0 collisions". What was built:
 
-**Why this is the right next step:** it turns the open-loop 8%-of-frames result into an end-to-end
-safety claim ("the dynamic shield admits collisions the static one does not, and eliminates them")
-— the moving-world analogue of the repo's central static-shield result. All primitives exist; this
-is wiring, an eval, and tests, not new theory.
+- **`nav_env.DynamicScene`** — static background (movers lifted out) + `MovingObstacle` list +
+  start + goal.
+- **`nav_env.DynamicNavEnv`** (subclasses `DriveNavEnv`) — each `step` advances every mover to
+  `box_at(step*dt)` and rebuilds the obstacle grid; the collision check, rays, and *static* shield
+  read `static ∪ movers-now`, the *dynamic* shield reads `static_grid + movers-now` directly.
+  `cfg.dynamic_shield` (on `DynamicNavConfig`) picks which. A small `grid` property was added to
+  `DriveNavEnv` so the shared observation/info code reads the per-step grid. `info["hit_mover"]`
+  attributes a collision to the moving car specifically.
+- **`nav_env.KittiDynamicScenes`** — mines 0009 for the **91 crossing encounters** (a moving
+  tracklet ahead of the ego, crossing *toward* its line at ≥1 m/s lateral), lifts the actor out,
+  re-inserts it as a constant-velocity box seeded from `KittiDrive.actor_velocity` (promoted here
+  from `eval_dynamic_shield.py`'s `_actor_velocity`).
+- **`scripts/eval_dynamic_policies.py`** and **4 new tests** in `test_nav_env.py`.
 
-### Build plan (concrete)
+**The result (200 episodes, gap-following):** the **static shield drives into a crossing car 51×,
+the dynamic shield 4×**. The dynamic shield's residual 30 mover-collisions are the mover striking
+an ego that had already braked to a stop (unavoidable by braking); **all 34 of its collisions are
+`ics`-flagged** — it never silently drives into a car it could have stopped for. The 4 residual
+"drove in" are ICS-while-moving (a car cutting inside the stopping envelope faster than any brake
+escapes — the documented scope). Full table in `scripts/RESULTS.md` ("Closed-loop dynamic
+traffic").
 
-1. **`DynamicScene`** (in `nav_env.py`, next to `Scene`): a static background grid **with movers
-   removed** + a list of `dynamics.MovingObstacle` (initial box + constant velocity) + `start` +
-   `goal`. Movers travel at constant velocity for the episode — matches the shield's model and is
-   cleaner than replaying the recorded path.
-2. **Dynamic env** — either a `DynamicNavEnv` or a branch inside `DriveNavEnv.step`:
-   - track sim time; each `step` advances every mover to `box_at(step * dt)`;
-   - the **collision check** and **both shields** must see the *same* obstacle set = static grid
-     ∪ current mover boxes. `dynamics.BoxField(boxes)` already wraps oriented boxes as an
-     `ObstacleField`, so static-shield-vs-movers is `safety_shield(…, BoxField(static_and_movers))`;
-     dynamic is `dynamic_safety_shield(accel, steer, state, static_field, movers_now, cfg)`.
-   - `certifiable_start` must use the field at t=0.
-3. **Scene source `KittiDynamicScenes`**: pick 0009 frames where a mover crosses the ego's forward
-   corridor (the interacting 8% — filter like `eval_dynamic_shield.py` does, `box[0] > ego.x` and
-   heading across). Build static occupancy with the mover lifted out (`occ & ~rasterize_box`),
-   seed the `MovingObstacle` from the tracklet's frame velocity (`_actor_velocity` in
-   `eval_dynamic_shield.py`), place ego at `vehicle_state_in_lidar`, goal ahead.
-4. **`scripts/eval_dynamic_policies.py`**: gap-following / PPO under static shield vs dynamic
-   shield across the dynamic scenes; print success / collisions. **Expected result:** the static
-   shield admits collisions with crossing cars; the dynamic shield drives them toward 0 (to the
-   extent the constant-velocity prediction holds).
-5. **Tests** (`test_nav_env.py` or `test_dynamics.py`): a `DynamicScene` episode where a crossing
-   mover collides the static-shielded run but not the dynamic-shielded one — the closed-loop
-   version of `test_static_shield_hits_a_crossing_car_that_the_dynamic_shield_avoids`.
+Key implementation decisions (do not re-litigate):
+- **Composite obstacle set via a rebuilt grid, not `BoxField`.** The build plan suggested
+  `BoxField(static ∪ movers)`, but static geometry is a grid, not boxes — so each step rasterises
+  the movers into the static occupancy and builds a `BEVGrid` (one distance transform/step, cached;
+  fine for an eval). The dynamic shield still takes the static grid + movers list directly, since
+  its `moving_clearance` wants the velocity.
+- **Collision timing mirrors the unit test:** step the ego, advance the world one `dt`, then check
+  the new state against movers at the new time — matching the shield's one-step-ahead certificate.
+- **`certifiable_start` against the frozen t=0 world** (background + mover in place), so no episode
+  starts already unable to stop; both shields then start from the same clamped speed (fair).
+- **Static-shield mover-collisions edge *up* vs unshielded (46→51)** — not a bug: the shield
+  prevents the static-geometry crashes that were ending those episodes early, so more survive to
+  the crossing, where (being static-only) it drives in. The headline is the *drove-in* split.
 
-### Gotchas / decisions already made (do not re-litigate)
+## The next step (pick one)
 
-- **Feed the shield from tracklet motion, not label-free.** Stage 1's label-free velocity is
-  ~95% false-positive (aspect-change parallax on parked cars — 0009 has 89); it would have the
-  shield braking for phantoms everywhere. Measured, not assumed. Label-free is the perception gap,
-  not the feed. (Details in the dynamic-obstacles session note below.)
-- **Constant-velocity reachable set** (time-indexed, not swept-union). The shield's guarantee is
-  sound *relative to that prediction*; an obstacle predicted to cut in trips `ics`. That is the
-  honest scope — state it, don't hide it.
-- **Frames are in the velodyne frame**; tracklet poses are native to it, so boxes drop into the
-  BEV with no transform. Ego (rear axle) is at `drive.vehicle_state_in_lidar()`, driving +x.
-- Reuse, don't rebuild: `dynamics.{MovingObstacle,BoxField,dynamic_safety_shield,
-  can_stop_safely_dynamic,max_safe_speed_dynamic,point_box_distance}`, `bev.rasterize_box`,
-  `kitti.KittiDrive.{moving_tracklets,tracklet_boxes}`, and `eval_dynamic_shield.py`'s
-  `_actor_velocity` helper (worth promoting into `kitti.py` if reused).
+3a is closed, so the dynamic-obstacle line is essentially complete. Candidates, roughly ordered:
+
+1. **Resolve the branch / `main`** (see "⚠ Read first"). This is the oldest open thread and should
+   probably go first — fast-forward or open the repo's first PR before piling on more.
+2. **Tune `KittiDynamicScenes` / the encounter filter** — the 91 encounters use fixed thresholds
+   (`min_lateral_speed=1.0`, `ahead_margin=5`, `edge_margin=5`); a sweep might sharpen the table,
+   and PPO-through-shield on the dynamic scenes is untried (`--ppo models/…`).
+3. **Evasive steering in the shield** (option 5) — search over steer candidates, not just
+   commanded-vs-held; the shield currently only brakes, so it can't dodge a crossing car it might
+   have steered around. This is the most *new* headline available now.
+4. Better label-free perception (3b) to close the stage-1 ~95%-FP wall; or more drives/seeds (7).
 
 ### Fast reproduce of the current state
 
 ```bash
-python3 -m pytest tests/ -q                              # 186 green
+python3 -m pytest tests/ -q                              # 190 green
 python3 scripts/fetch_kitti.py --tracklets               # tiny; labels for 0009 (drive already on disk)
-python3 scripts/eval_dynamic_shield.py                   # static vs dynamic permitted speed, 0009 movers
-python3 scripts/eval_dynamics.py --window 4 --coherence 0.8 --min-speed 1.5   # the 95%-FP perception wall
+python3 scripts/eval_dynamic_policies.py --episodes 200  # NEW: closed-loop static vs dynamic shield
+python3 scripts/eval_dynamic_shield.py                   # open-loop static vs dynamic permitted speed
 ```
 
 ---
@@ -245,7 +249,7 @@ The seed idea was `gsplat-rt`'s nav capstone: a hard safety shield wrapping any 
 question was whether it survives contact with *driving*. Mostly it did — but almost nothing
 ported unchanged, and one of its headline results did not reproduce (below).
 
-## Status — **186 tests green** (on `feat/map-fusion`; `main` is at 105)
+## Status — **190 tests green** (on `feat/map-fusion`; `main` is at 105)
 
 | milestone | state | measured |
 | --- | --- | --- |
@@ -262,6 +266,7 @@ ported unchanged, and one of its headline results did not reproduce (below).
 | **Cautious speed cap + unknown hole-closing** | done — *on the branch* | **honest map drivable: hard-block 4% → cap 34–40% success; shield still 0 collisions; corridor 10→21 m** |
 | **Object tracklets + carving credited by labels** | done — *on the branch* | **0009 has 12 real movers (not "too static"); carving retires 9% of trail keeping 96% of the present actor** |
 | **Dynamic shield: braking for an obstacle's predicted path** | done — *on the branch* | **static shield crashes a crossing car the dynamic one stops clear of; binds on 8% of real mover-frames (worst −8.3 m/s)** |
+| **Closed-loop dynamic env: movers step while a policy drives** | done — *on the branch, uncommitted* | **on 0009's 91 crossing encounters the static shield drives in 51×, the dynamic shield 4×; residual hits are movers striking a stopped ego, all ics-flagged** |
 
 Full numbers: `README.md` and `scripts/RESULTS.md`.
 
@@ -489,10 +494,11 @@ Seed spread was small (1.0–2.9 pts), unusually low for deep RL. Sweep cost ~35
   things genuinely open: (1) carving's de-smear is capped by the safety height-gate, so a
   *dedicated* dynamic channel (use the tracklet labels, or a two-frame occupancy diff, to mark
   and forget movers without touching static geometry) could do better than the safe-tuned carve;
-  (2) **the shield still treats every obstacle as static** — the real AV problem is reasoning
-  about a moving obstacle's *reachable set*, which the tracklet velocities now make buildable.
-  The infra is in place (`KittiDrive.moving_tracklets`, `bev.rasterize_box`). NB: the old claim
-  that 0009 is "too static" was **wrong** — it has 12 real movers.
+  (2) ~~the shield still treats every obstacle as static~~ **RESOLVED** — the dynamic shield
+  reasons about a moving obstacle's reachable set, and (this session) the closed-loop
+  `DynamicNavEnv` measures it end-to-end. What remains open here is only *perception* (label-free
+  velocity is the ~95%-FP wall) and *evasion* (the shield brakes, never swerves). NB: the old
+  claim that 0009 is "too static" was **wrong** — it has 12 real movers.
 - **The free/unknown distinction is now drivable via the cap (resolved this session), but the
   cap is one design point, not a swept one.** `unknown_blocks` (hard) is sound but unnavigable
   (4%); the **cautious speed cap** + **hole-closing** makes it drivable (34–40%) with the shield
@@ -525,12 +531,12 @@ Seed spread was small (1.0–2.9 pts), unusually low for deep RL. Sweep cost ~35
 
 ## What next — options
 
-**My recommendation now: (3a) — close the loop.** Options 1 and 2 are done, and option 3's core
-(the dynamic shield) is built and measured. The one missing piece to make it a headline like the
-static shield's "0 collisions" table is a **closed-loop dynamic env**: obstacles that step along
-their velocity while a policy drives, so `evaluate` can report success/collisions with the
-dynamic shield vs the static one on moving traffic. All the primitives exist; it needs a
-`DynamicScene` whose `step` advances the movers.
+**Update: (3a) is now done** — the closed-loop dynamic env is built and the moving-world table
+measured (static shield drives in 51×, dynamic 4×, on 0009's 91 crossing encounters; see the
+START HERE session note). Options 1, 2, and 3 are all done. **My recommendation now: resolve the
+branch/`main` thread first (see ⚠ Read first), then evasive steering (option 5)** — the shield
+only brakes, so it can't dodge a crossing car it might have steered around, which is the most
+*new* headline still available.
 
 1. **✅ DONE — softer unknown semantics, so the honest map is drivable.** The **cautious speed
    cap** plus **hole-closing** takes hard-block's 4% to 34–40% with the shield still at 0
@@ -539,14 +545,14 @@ dynamic shield vs the static one on moving traffic. All the primitives exist; it
 2. **✅ DONE (differently than planned) — carving credited on real traffic.** No new drive: 0009
    has 12 real movers, and `eval_carving_credit.py` credits carving with the object labels (9%
    trail retired at the safe point, 96% of the present actor kept). See the tracklet section.
-3. **✅ MOSTLY DONE — dynamic obstacles.** The **dynamic shield** (`dynamics.dynamic_safety_shield`)
+3. **✅ DONE — dynamic obstacles.** The **dynamic shield** (`dynamics.dynamic_safety_shield`)
    time-indexes the braking rollout so it brakes for where an obstacle is *going*; it crashes a
    crossing car the static shield hits, and binds on 8% of real 0009 mover-frames. **Stage 1
    (label-free velocity) is the measured perception wall** — ~95% false positive from
    aspect-change parallax, too dirty to drive the shield, so the shield runs on tracklet motion.
-   *Remaining (3a):* the **closed-loop dynamic env** for an end-to-end table — a `DynamicScene`
-   that advances movers each `step`, then `eval_policies`-style success/collision numbers, static
-   vs dynamic shield, on 0009's traffic (frames ~330–425). *Optional (3b):* better label-free
+   **3a (closed-loop dynamic env) is now done** — `DynamicNavEnv` + `KittiDynamicScenes` +
+   `eval_dynamic_policies.py`: static shield drives into a crossing car 51× vs the dynamic
+   shield's 4× (200 episodes). See the START HERE session note. *Optional (3b):* better label-free
    perception (scene-flow with shape, or a learned head) to close the stage-1 gap.
 5. Evasive steering in the shield (search over steer candidates, not just two).
 6. Strengthen VO: local bundle adjustment or keyframing; SuperPoint+LightGlue front-end beat
@@ -586,7 +592,8 @@ python3 scripts/eval_carving_credit.py --window 5 --persistence 2
 
 # dynamic obstacles: label-free velocity accuracy, then the dynamic shield vs the static one
 python3 scripts/eval_dynamics.py --window 4 --coherence 0.8 --min-speed 1.5
-python3 scripts/eval_dynamic_shield.py
+python3 scripts/eval_dynamic_shield.py                   # open-loop: static vs dynamic permitted speed
+python3 scripts/eval_dynamic_policies.py --episodes 200  # closed-loop: static vs dynamic shield on movers
 
 # mapping: the sweep behind the accumulated-map table, and the ego self-filter audit
 python3 scripts/eval_mapping.py --sweep 1 2 3 5 10 20 --every 12 --max-speed 21
