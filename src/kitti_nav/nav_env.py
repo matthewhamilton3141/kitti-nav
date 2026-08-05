@@ -473,6 +473,24 @@ class SyntheticScenes:
         return Scene(grid, certifiable_start(start, grid, self.vehicle), goal)
 
 
+def kitti_frame_split(n_frames: int, holdout: float = 0.3,
+                      stride: int = 1) -> tuple[np.ndarray, np.ndarray]:
+    """Deterministic **contiguous** train/test split of a drive's frames.
+
+    Contiguous rather than interleaved so the held-out frames are a genuinely different stretch
+    of the drive: consecutive frames of a moving vehicle are near-duplicate views of the same
+    street, and an interleaved split would leak them across the boundary and flatter the
+    transfer. Training on the first `1 - holdout` and testing on the last `holdout` therefore
+    measures generalisation to road the policy never saw. `stride` subsamples the *train* pool
+    only (so per-frame fused grids stay cache-resident during training); the test set is dense.
+    Both `train` and `test` are computed the same way here so a trainer and an evaluator agree
+    on the split without passing frame arrays around.
+    """
+    frames = np.arange(int(n_frames))
+    cut = int(round(int(n_frames) * (1.0 - holdout)))
+    return frames[:cut][::max(int(stride), 1)], frames[cut:]
+
+
 @dataclass
 class KittiScenes:
     """Real recorded street geometry: BEV grids built from a drive's Velodyne scans.

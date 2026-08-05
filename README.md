@@ -30,8 +30,9 @@ Runs entirely on a laptop — pure NumPy + OpenCV, no GPU, no simulator install.
 | Dynamic shield (braking for a moving obstacle's path) | done — **static shield crashes a crossing car it stops clear of; binds on 8% of real mover-frames** |
 | Closed-loop dynamic traffic (movers step while a policy drives) | done — **on 0009's crossing cars the static shield drives in 51×, the dynamic shield 4×; its residual hits are movers striking a stopped ego, all ics-flagged** |
 | Evasive steering (swerve out of an ICS rather than brake into it) | done, opt-in — **cleanly avoids an open-road obstacle it can't brake for; marginal on cluttered real traffic (46 → 45)** |
+| Training on real KITTI geometry (vs synthetic transfer) | done — **held-out shielded success 71% → 78% (+7 pts), raw collisions 52 → 40; shield still 0 collisions** |
 
-**195 tests pass.** Dataset-backed tests skip cleanly when KITTI isn't downloaded; the
+**197 tests pass.** Dataset-backed tests skip cleanly when KITTI isn't downloaded; the
 environment core is pure NumPy and tests without any RL stack installed.
 
 ## Quickstart
@@ -415,6 +416,20 @@ Shielding a learned policy turns out to be nearly free, and on synthetic scenes 
 success (66% → 70%). That reads oddly until you notice a collision ends the episode as a
 failure: the shield converts would-be crashes into driving that sometimes still reaches the
 goal.
+
+### Training on the real geometry recovers half the transfer gap
+
+Those tables are a *transfer* test — the policy was trained on synthetic fields and has never
+seen a real street. So what if it trains on the drive's own occupancy? To keep it honest the
+drive is split **contiguously** (first 70% of frames to train on, last 30% held out and scored),
+so the test road is a stretch the policy never saw — an interleaved split would leak near-
+duplicate adjacent frames across the boundary. On the held-out fused frames, KITTI-trained
+shielded success is **78% vs the synthetic-transfer policy's 71% (+7 points)**, with unshielded
+collisions down 52 → 40 — recovering about half of what the transfer cost. **The shield stays at
+0 collisions in every column** regardless of what the policy learned, which is the point: the
+certificate is a property of the method, not the training distribution. Full table and the
+`train_ppo.py --scenes kitti-fused` command in [`scripts/RESULTS.md`](scripts/RESULTS.md). (Still
+one drive — this is within-drive generalisation to a later stretch, not cross-drive.)
 
 ### A negative result, replicated across 5 training seeds
 

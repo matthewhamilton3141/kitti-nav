@@ -44,6 +44,43 @@ geometry a single scan is blind to.
 | PPO (raw) + shield at eval | 62% | **0** | 29.9 | 29 |
 | PPO trained *through* the shield | 64% | **0** | 30.3 | 29 |
 
+## Training on real KITTI geometry — recovering the transfer gap on held-out road
+
+Every policy above was trained on synthetic obstacle fields and *transferred* to KITTI, which
+costs 12–14 points. The obvious untried lever is to train on the drive's own recorded occupancy.
+To keep that honest, the drive is split **contiguously** (`kitti_frame_split`): the first 70% of
+frames (strided, fused 5 scans) is the training pool, and the **last 30% — a stretch of road no
+policy trained on — is the only thing scored**. A contiguous split matters: consecutive frames of
+a moving car are near-duplicate views, so an interleaved split would leak the test road into
+training. Both synthetic and KITTI policies are 600k steps; scored on the held-out fused frames,
+200 episodes:
+
+| policy (600k steps) | raw | + shield at eval |
+| --- | ---: | ---: |
+| gap-following (baseline) | 38% / 120 coll | 34% / **0** |
+| synthetic-trained, raw | 68% / 63 | 63% / **0** |
+| synthetic-trained, through shield | 74% / 52 | 71% / **0** |
+| **KITTI-fused-trained, raw** | 80% / 40 | 77% / **0** |
+| **KITTI-fused-trained, through shield** | 78% / 44 | **78% / 0** |
+
+**Training on the real geometry lifts held-out shielded success from 71% to 78% (+7 points)** over
+the best synthetic-transfer policy, and cuts unshielded collisions (52 → 40) — recovering roughly
+half of what the transfer cost, on road the policy never saw. **The shield holds 0 collisions in
+every column regardless of what the policy learned**, which is the load-bearing claim: the
+certificate is a property of the method, not of the training distribution. Two honest caveats: it
+is still one drive (within-drive generalisation to a later stretch, not cross-drive), and training
+*through* the shield again shows only a small edge over bolting it on (78% vs 77%), consistent with
+the seed-swept negative result below — the large in-loop win from `gsplat-rt` does not reproduce.
+
+Reproduce (models are gitignored; ~3 min raw, ~10 min shielded on CPU):
+
+```bash
+python3 scripts/train_ppo.py --scenes kitti-fused --steps 600000 --out models/ppo_kitti_raw
+python3 scripts/train_ppo.py --scenes kitti-fused --shield --steps 600000 --out models/ppo_kitti_shielded
+python3 scripts/eval_kitti_trained.py --episodes 200 \
+  --model synthetic=models/ppo_shielded.zip --model kitti=models/ppo_kitti_shielded.zip
+```
+
 ## What holds
 
 **The shield's guarantee is absolute across every run: 0 collisions, always.** That covers a

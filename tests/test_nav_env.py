@@ -22,6 +22,7 @@ from kitti_nav.nav_env import (
     certifiable_start,
     evaluate,
     gap_following_policy,
+    kitti_frame_split,
     rasterize_circles,
     rollout,
 )
@@ -207,6 +208,21 @@ def test_synthetic_scenes_keep_the_goal_reachable():
     for _ in range(20):
         scene = scenes.sample(rng)
         assert scene.grid.distance_to_obstacles(scene.goal[None, :])[0] > 0.0
+
+
+def test_kitti_frame_split_is_contiguous_disjoint_and_holds_out_the_tail():
+    """Train/test split must not leak: held-out frames are the drive's last stretch, unseen."""
+    train, test = kitti_frame_split(100, holdout=0.3, stride=1)
+    assert set(train).isdisjoint(set(test)), "a frame trained on must not be scored on"
+    assert test.min() > train.max(), "held-out frames should be a later stretch, not interleaved"
+    assert list(test) == list(range(70, 100)), "the last 30% is held out"
+    assert list(train) == list(range(70))
+
+
+def test_kitti_frame_split_stride_thins_only_the_train_pool():
+    train, test = kitti_frame_split(100, holdout=0.3, stride=3)
+    assert list(train) == list(range(0, 70, 3)), "stride subsamples train"
+    assert list(test) == list(range(70, 100)), "test stays dense"
 
 
 # --- the shield in the loop ---------------------------------------------------------------------
