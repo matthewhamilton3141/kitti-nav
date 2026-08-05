@@ -7,26 +7,26 @@ notes — what was decided and why, what broke, and what is actually left.
 
 # ▶ START HERE — next step for a cleared session
 
-**Where things stand.** Branch `feat/map-fusion`, **190 tests green**
-(`python3 -m pytest tests/ -q`; dataset tests skip without KITTI). The **closed-loop dynamic env
-(option 3a) is DONE** — see the session note directly below this block. That work is **not yet
-committed**: the working tree has changes to `nav_env.py`, `kitti.py`, `test_nav_env.py`,
-`eval_dynamic_shield.py`, plus a new `scripts/eval_dynamic_policies.py` and doc updates
-(README / RESULTS / this file). Committing is the first action for whoever picks this up (the
-user hadn't asked yet). Last four *committed* commits, newest first:
+**Where things stand.** **190 tests green** (`python3 -m pytest tests/ -q`; dataset tests skip
+without KITTI). The **closed-loop dynamic env (option 3a) is DONE and committed** — see the
+session note directly below this block. **`main` was fast-forwarded to `feat/map-fusion` and
+pushed**, so the long-standing "the tree is not where you'd assume" divergence is **resolved**:
+`main` and `feat/map-fusion` are now the same commit (`12f6d73`), both on origin. Latest commits,
+newest first:
 
 ```
+12f6d73 feat: closed-loop dynamic env — static vs dynamic shield on moving traffic
+cb9d669 docs: add START HERE block to the handoff for the next cleared session
 18ada5e feat: dynamic shield — braking for where a moving obstacle is going (stage 2)
 ff5c2c0 feat: label-free BEV obstacle-velocity estimation (stage 1)
-b5cc275 feat: object tracklets, and free-space carving credited by labels
-3f5d75d feat: cautious speed cap makes the honest unknown map drivable
 ```
 
 Everything below the `▶` block is the deep record (session write-ups, then decisions, bugs,
 gaps, env facts). Read this block, then dip into those as needed — they are accurate and current.
 
-**Still pending (unchanged all session): `main` is 9+ commits behind and none of this is merged.**
-Decide fast-forward vs first PR before adding more — see "⚠ Read first" further down. Not blocking.
+**The branch/`main` decision is settled: it was a fast-forward, not a PR** (the "⚠ Read first"
+section below is now historical). The repo is back to a single up-to-date line; keep working on
+`feat/map-fusion` (or `main` — they coincide) as you prefer.
 
 ## ✅ DONE this session: the closed-loop dynamic env (option 3a)
 
