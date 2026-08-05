@@ -34,6 +34,13 @@ from dataclasses import dataclass
 import numpy as np
 
 from .bev import BEVConfig
+from .vehicle import (
+    ShieldResult,
+    VehicleConfig,
+    VehicleState,
+    footprint_discs,
+    step_state,
+)
 
 
 @dataclass(frozen=True)
@@ -47,7 +54,7 @@ class MovingObstacle:
 
     box: np.ndarray                 # (cx, cy, yaw, l, w)
     velocity: np.ndarray            # (vx, vy) m/s
-    n_cells: int
+    n_cells: int = 0                # occupancy support, when it came from the estimator
 
     @property
     def centre(self) -> np.ndarray:
@@ -148,3 +155,139 @@ def estimate_obstacle_velocities(occ_window: list[np.ndarray], cfg: BEVConfig, d
             continue
         out.append(MovingObstacle(c.box, (traj[-1] - traj[0]) / span, c.n_cells))
     return out
+
+
+# --- the dynamic shield: braking against where obstacles *will be* --------------------------
+
+def point_box_distance(points: np.ndarray, box: np.ndarray) -> np.ndarray:
+    """Distance (m) from each `(N, 2)` point to an oriented box `(cx, cy, yaw, l, w)`, 0 inside.
+
+    Rotates the points into the box's own frame and takes the axis-aligned point-to-rectangle
+    distance — the exact clearance the shield needs against a moving footprint, without
+    rasterising it into a grid every timestep.
+    """
+    p = np.asarray(points, float).reshape(-1, 2)
+    cx, cy, yaw, l, w = (float(v) for v in np.asarray(box, float).reshape(5))
+    d = p - np.array([cx, cy])
+    c, s = np.cos(yaw), np.sin(yaw)
+    xr = c * d[:, 0] + s * d[:, 1]                        # world -> box frame (rotate by -yaw)
+    yr = -s * d[:, 0] + c * d[:, 1]
+    dx = np.maximum(np.abs(xr) - l / 2.0, 0.0)
+    dy = np.maximum(np.abs(yr) - w / 2.0, 0.0)
+    return np.hypot(dx, dy)
+
+
+class BoxField:
+    """An `ObstacleField` of oriented boxes — lets the static shield run against boxes directly.
+
+    The `distance_to_obstacles` seam `vehicle.py` already speaks, backed by boxes instead of a
+    grid. Used to put a moving obstacle's *current* footprint in front of the ordinary shield,
+    which is the control condition the dynamic shield is measured against.
+    """
+
+    def __init__(self, boxes):
+        self.boxes = [np.asarray(b, float).reshape(5) for b in boxes]
+
+    def distance_to_obstacles(self, points: np.ndarray) -> np.ndarray:
+        p = np.asarray(points, float).reshape(-1, 2)
+        if not self.boxes:
+            return np.full(len(p), np.inf)
+        return np.min([point_box_distance(p, b) for b in self.boxes], axis=0)
+
+
+def moving_clearance(state: VehicleState, static_field, movers: list[MovingObstacle],
+                     cfg: VehicleConfig, t: float) -> float:
+    """Signed clearance (m) of the footprint against static geometry plus movers at time `t`.
+
+    The moving obstacles are advanced to `box_at(t)` — where constant velocity predicts them —
+    so a rollout that threads increasing `t` checks the vehicle against where each obstacle
+    *will be*, not where it is now.
+    """
+    centres, radius = footprint_discs(state, cfg)
+    d = (static_field.distance_to_obstacles(centres) if static_field is not None
+         else np.full(len(centres), np.inf))
+    for m in movers:
+        d = np.minimum(d, point_box_distance(centres, m.box_at(t)))
+    return float(np.min(d) - radius)
+
+
+def can_stop_safely_dynamic(state: VehicleState, static_field, movers: list[MovingObstacle],
+                            cfg: VehicleConfig, t0: float = 0.0) -> bool:
+    """Full-braking rollout that also advances the obstacles — the dynamic inductive invariant.
+
+    Identical to `vehicle.can_stop_safely` but the obstacles move with the clock: at braking
+    step `k` the vehicle is checked against the obstacles at `t0 + k*dt`. Holding steer stays
+    the conservative reading. Because both vehicle and obstacles are rolled forward under the
+    *predicted* constant velocity, certifying a state means the car can brake clear of the
+    obstacles' predicted paths — sound to the extent the prediction holds, which is the honest
+    scope of any behaviour-predicting planner (cf. RSS's bounded-behaviour assumption).
+    """
+    s = state
+    t = t0
+    for _ in range(cfg.max_brake_steps):
+        if moving_clearance(s, static_field, movers, cfg, t) < cfg.safety_margin:
+            return False
+        if s.v <= 1e-9:
+            return True
+        s = step_state(s, -cfg.max_decel, s.steer, cfg)
+        t += cfg.dt
+    return False
+
+
+def dynamic_safety_shield(accel_cmd: float, steer_cmd: float, state: VehicleState,
+                          static_field, movers: list[MovingObstacle],
+                          cfg: VehicleConfig) -> ShieldResult:
+    """Braking-aware shield that reasons about a moving obstacle's predicted path.
+
+    The exact structure of `vehicle.safety_shield` — search accel from commanded down to full
+    braking, over the commanded steer then the held steer, admit the first level that is clear
+    now *and* leaves a certifiable dynamic stop — but every clearance is time-indexed: the
+    successor state sits one step ahead, so obstacles are advanced by one `dt` for the
+    immediate check and by the rollout clock thereafter.
+
+    Where the static shield sees only where an obstacle *is*, this brakes for where it is
+    *going*, which is the difference between stopping short of a car crossing ahead and driving
+    into where it will be. Falls back to held-steer maximum braking with `ics=True` when even
+    that cannot certify — an obstacle predicted to cut inside the stopping envelope.
+    """
+    hi = float(np.clip(accel_cmd, -cfg.max_decel, cfg.max_accel))
+    accels = np.linspace(hi, -cfg.max_decel, max(int(cfg.n_accel_candidates), 2))
+
+    steer_options = [steer_cmd]
+    if not np.isclose(steer_cmd, state.steer):
+        steer_options.append(state.steer)
+
+    for steer in steer_options:
+        for a in accels:
+            nxt = step_state(state, float(a), float(steer), cfg)
+            if (moving_clearance(nxt, static_field, movers, cfg, cfg.dt) >= cfg.safety_margin
+                    and can_stop_safely_dynamic(nxt, static_field, movers, cfg, t0=cfg.dt)):
+                intervened = not (np.isclose(a, hi) and np.isclose(steer, steer_cmd))
+                return ShieldResult(accel=float(a), steer=float(steer),
+                                    intervened=bool(intervened), ics=False)
+
+    return ShieldResult(accel=-cfg.max_decel, steer=state.steer, intervened=True, ics=True)
+
+
+def max_safe_speed_dynamic(static_field, movers: list[MovingObstacle], cfg: VehicleConfig,
+                           state: VehicleState, tol: float = 0.05) -> float:
+    """Highest speed from which a dynamic stop is still certifiable at `state`'s pose.
+
+    The moving counterpart of `vehicle.max_safe_speed`: bisected because `can_stop_safely_dynamic`
+    has no closed form, and valid because the predicate is monotone in speed — a faster car
+    travels further into the obstacles' predicted paths. Directly comparable to the static
+    permitted speed, so the gap is exactly what reasoning about motion costs (or saves).
+    """
+    def ok(v: float) -> bool:
+        return can_stop_safely_dynamic(
+            VehicleState(state.x, state.y, state.yaw, v, state.steer), static_field, movers, cfg)
+
+    if not ok(0.0):
+        return 0.0
+    lo, hi = 0.0, cfg.max_speed
+    if ok(hi):
+        return hi
+    while hi - lo > tol:
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if ok(mid) else (lo, mid)
+    return lo

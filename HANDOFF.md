@@ -8,7 +8,7 @@ notes — what was decided and why, what broke, and what is actually left.
 Option 1 from the previous handoff — "softer unknown semantics, so the honest map is
 drivable" — is **done, and it works**. Hard `unknown_blocks` was sound but unnavigable (4%
 success); the new **cautious speed cap** lifts that to **34–40%** while the shield stays at **0
-collisions on every shielded row**. On `feat/map-fusion`, pushed, **181 tests green**.
+collisions on every shielded row**. On `feat/map-fusion`, pushed, **186 tests green**.
 
 What was built, and the two decisions inside it:
 
@@ -71,30 +71,44 @@ dynamic-obstacle shield scenario will want.
 
 Reproduce: `python3 scripts/eval_carving_credit.py --window 5 --persistence 2`.
 
-## And this sitting: dynamic obstacles started — label-free velocity is the wall (checkpoint)
+## And this sitting: dynamic obstacles — the shield now reasons about motion
 
-Began option 3 (dynamic obstacles) with the design the user picked: **label-free** motion (from
-occupancy, not labels) feeding a **constant-velocity** reachable set. Stage 1 — the label-free
-velocity estimator — is built, tested, and **honestly characterised as the bottleneck**:
+Option 3 (dynamic obstacles) is built in two stages. **Stage 1 (label-free velocity) hit a
+perception wall; stage 2 (the dynamic shield) is done and works, fed by tracklet motion** — the
+direction the user chose after seeing stage 1's false-positive rate.
 
-- `dynamics.estimate_obstacle_velocities(occ_window, …)` tracks occupancy connected-components
-  across a short ego-compensated window and keeps only **temporally coherent** motion
-  (net/path displacement ratio). `scripts/eval_dynamics.py` grades it against the tracklets.
-- **Result: ~35% detection at ~95% false positive, at every operating point.** When it matches,
-  velocity is good (~0.55 m/s speed error, ~6° heading). The FPs are **not** slow jitter —
-  raising the speed floor barely moves them — they are **aspect-change parallax**: driving past a
-  parked car (0009 has 89), the lidar sees a new face each frame, so its centroid drifts
-  coherently and reads as real motion. Occupancy-centroid velocity cannot separate that from a
-  slow vehicle without shape/appearance. Full table in `scripts/RESULTS.md`.
-- **Implication for stage 2 (the shield):** a 95%-FP feed would have the shield braking for
-  parked cars everywhere — undriveable. The sound path is to build the **reachable-set shield
-  against tracklet motion** (clean ground truth, isolates the safety reasoning from perception)
-  and treat label-free as the measured perception gap. **This is the open decision left for the
-  next session / the user** — it revisits the "label-free" choice now that we know its FP rate.
-  The estimator stays useful either way (the shield brakes conservatively for any mover, so a
-  false positive costs speed, not safety).
+**Stage 1 — label-free velocity from occupancy (`dynamics.estimate_obstacle_velocities`).**
+Tracks occupancy connected-components across a short ego-compensated window, keeping only
+**temporally coherent** motion (net/path displacement ratio). Graded against tracklets
+(`eval_dynamics.py`): **~35% detection at ~95% false positive, at every operating point.**
+Velocity is accurate *when* it matches (~0.55 m/s, ~6°), but the FPs are **aspect-change
+parallax**, not jitter — driving past a parked car (0009 has 89), the lidar sees a new face each
+frame, so its centroid drifts coherently and reads as motion. Occupancy-centroid velocity cannot
+separate that from a slow vehicle without shape. **Conclusion: too FP-heavy to drive the shield**
+(~10 phantom movers/frame ⇒ brakes for parked cars everywhere). Kept as the measured perception
+gap; the estimator is still sound infra.
 
-Reproduce: `python3 scripts/eval_dynamics.py --window 4 --coherence 0.8 --min-speed 1.5`.
+**Stage 2 — the dynamic shield (`dynamics.dynamic_safety_shield`), fed tracklet motion.** It is
+`vehicle.safety_shield` with the clearance checks **time-indexed**: through the braking rollout
+the obstacles advance along their velocity (`box_at(t)`), so it certifies "can I stop clear of
+where they *will be*." Same inductive structure + held-steer fallback; sound *to the extent the
+constant-velocity prediction holds* (an obstacle predicted to cut in trips `ics`). Two results:
+- **Synthetic crossing test:** a car sweeping across the lane — the **static shield drives into
+  it**, the **dynamic shield stops clear** (`test_static_shield_hits_a_crossing_car…`). The
+  moving-obstacle analogue of braking-vs-one-step.
+- **Real 0009 (static vs dynamic permitted speed at the ego, 421 mover-frames):** dynamic is
+  **more conservative on 8%** (worst **−8.3 m/s**), unchanged on 92% (mover not in the path),
+  never wrongly more permissive. That 8% is exactly the frames where treating a moving world as
+  frozen is a safety error.
+
+New API in `dynamics.py`: `MovingObstacle` (+ `box_at`), `point_box_distance`, `BoxField`,
+`moving_clearance`, `can_stop_safely_dynamic`, `dynamic_safety_shield`, `max_safe_speed_dynamic`.
+The shield core is pure-NumPy and composes `vehicle.py` primitives (no change to the certified
+static core). **Not yet done:** a closed-loop dynamic *env* (obstacles stepping while a policy
+drives) for an end-to-end success/collision table — the pieces are all here, it just needs a
+`DynamicScene` that advances movers each `step`. That is the natural next build.
+
+Reproduce: `python3 scripts/eval_dynamics.py` and `python3 scripts/eval_dynamic_shield.py`.
 
 ## ⚠ Read first: the tree is not where you'd assume
 
@@ -144,7 +158,7 @@ The seed idea was `gsplat-rt`'s nav capstone: a hard safety shield wrapping any 
 question was whether it survives contact with *driving*. Mostly it did — but almost nothing
 ported unchanged, and one of its headline results did not reproduce (below).
 
-## Status — **181 tests green** (on `feat/map-fusion`; `main` is at 105)
+## Status — **186 tests green** (on `feat/map-fusion`; `main` is at 105)
 
 | milestone | state | measured |
 | --- | --- | --- |
@@ -160,6 +174,7 @@ ported unchanged, and one of its headline results did not reproduce (below).
 | **Free-space carving + occupied/free/unknown map** | done — *on the branch* | **map-metric non-result, but carving wins +4 pts on the planner; shield 0 collisions on every map (below)** |
 | **Cautious speed cap + unknown hole-closing** | done — *on the branch* | **honest map drivable: hard-block 4% → cap 34–40% success; shield still 0 collisions; corridor 10→21 m** |
 | **Object tracklets + carving credited by labels** | done — *on the branch* | **0009 has 12 real movers (not "too static"); carving retires 9% of trail keeping 96% of the present actor** |
+| **Dynamic shield: braking for an obstacle's predicted path** | done — *on the branch* | **static shield crashes a crossing car the dynamic one stops clear of; binds on 8% of real mover-frames (worst −8.3 m/s)** |
 
 Full numbers: `README.md` and `scripts/RESULTS.md`.
 
@@ -423,10 +438,12 @@ Seed spread was small (1.0–2.9 pts), unusually low for deep RL. Sweep cost ~35
 
 ## What next — options
 
-**My recommendation now: (3).** Options 1 and 2 are done — the honest map is drivable (the cap),
-and carving is credited on real movers (tracklets). 0009 turned out to *have* traffic, so no new
-drive is needed. What is left and would most move the story is making the safety argument reason
-about **motion**, for which the tracklet infra is now in place.
+**My recommendation now: (3a) — close the loop.** Options 1 and 2 are done, and option 3's core
+(the dynamic shield) is built and measured. The one missing piece to make it a headline like the
+static shield's "0 collisions" table is a **closed-loop dynamic env**: obstacles that step along
+their velocity while a policy drives, so `evaluate` can report success/collisions with the
+dynamic shield vs the static one on moving traffic. All the primitives exist; it needs a
+`DynamicScene` whose `step` advances the movers.
 
 1. **✅ DONE — softer unknown semantics, so the honest map is drivable.** The **cautious speed
    cap** plus **hole-closing** takes hard-block's 4% to 34–40% with the shield still at 0
@@ -435,13 +452,15 @@ about **motion**, for which the tracklet infra is now in place.
 2. **✅ DONE (differently than planned) — carving credited on real traffic.** No new drive: 0009
    has 12 real movers, and `eval_carving_credit.py` credits carving with the object labels (9%
    trail retired at the safe point, 96% of the present actor kept). See the tracklet section.
-3. **Dynamic obstacles — the recommended next.** The shield still treats every obstacle as
-   static. Extend it to reason about a moving obstacle's **reachable set** over the braking
-   horizon rather than a frozen footprint — this is where the safety argument gets properly hard
-   and where "AV" actually lives. Two feeds are now available for the obstacle's velocity: the
-   tracklet tracks (`moving_tracklets`, world-frame), or a label-free two-frame occupancy diff.
-   `bev.rasterize_box` paints a predicted future footprint straight into the grid the shield
-   already reads. Start with a single labelled mover from 0009's frame ~330–425 cluster.
+3. **✅ MOSTLY DONE — dynamic obstacles.** The **dynamic shield** (`dynamics.dynamic_safety_shield`)
+   time-indexes the braking rollout so it brakes for where an obstacle is *going*; it crashes a
+   crossing car the static shield hits, and binds on 8% of real 0009 mover-frames. **Stage 1
+   (label-free velocity) is the measured perception wall** — ~95% false positive from
+   aspect-change parallax, too dirty to drive the shield, so the shield runs on tracklet motion.
+   *Remaining (3a):* the **closed-loop dynamic env** for an end-to-end table — a `DynamicScene`
+   that advances movers each `step`, then `eval_policies`-style success/collision numbers, static
+   vs dynamic shield, on 0009's traffic (frames ~330–425). *Optional (3b):* better label-free
+   perception (scene-flow with shape, or a learned head) to close the stage-1 gap.
 5. Evasive steering in the shield (search over steer candidates, not just two).
 6. Strengthen VO: local bundle adjustment or keyframing; SuperPoint+LightGlue front-end beat
    ORB in `gsplat-rt` (3.5 cm vs 5.7 cm ATE on TUM) but is box-gated. Note the mapping result
@@ -472,11 +491,15 @@ about **motion**, for which the tracklet infra is now in place.
 ## Commands worth knowing
 
 ```bash
-python3 -m pytest tests/ -q                     # 181 green; dataset tests skip without KITTI
+python3 -m pytest tests/ -q                     # 186 green; dataset tests skip without KITTI
 
 # object tracklets: fetch the labels (tiny), then credit carving's de-smear on real movers
 python3 scripts/fetch_kitti.py --tracklets
 python3 scripts/eval_carving_credit.py --window 5 --persistence 2
+
+# dynamic obstacles: label-free velocity accuracy, then the dynamic shield vs the static one
+python3 scripts/eval_dynamics.py --window 4 --coherence 0.8 --min-speed 1.5
+python3 scripts/eval_dynamic_shield.py
 
 # mapping: the sweep behind the accumulated-map table, and the ego self-filter audit
 python3 scripts/eval_mapping.py --sweep 1 2 3 5 10 20 --every 12 --max-speed 21

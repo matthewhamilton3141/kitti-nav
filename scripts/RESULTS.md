@@ -363,7 +363,7 @@ Four things, in order of how much they matter:
   than assumed. `outside_is_free` remains the optimistic default; the cap is the drivable
   *honest* one.
 
-## Toward dynamic obstacles — label-free velocity is the bottleneck, and it is measured
+## Dynamic obstacles — a shield that brakes for where a car is going, and the perception wall
 
 The shield still treats every obstacle as a frozen wall. Making it reason about *motion* needs
 each obstacle's velocity, and the deployable way to get it is from occupancy alone —
@@ -392,19 +392,53 @@ fundamentally cannot separate this from a slow-moving vehicle without shape/appe
 
 What this means for the shield, stated plainly: **label-free BEV velocity is not clean enough to
 feed a dynamic shield directly** — ~10 phantom movers per frame would have it braking for parked
-cars everywhere. It is sound to build the reachable-set shield against the *tracklet* motion
-(clean ground truth, isolating the shield's reasoning from perception) and to treat the label-free
-estimate as the characterised perception gap it is. The estimator, its accuracy, and its failure
-mode are all in place and measured; the safety reasoning is the next build. `dynamics.py` unit
-tests pin the mechanics on synthetic occupancy where truth is exact.
+cars everywhere. So the reachable-set shield is built and measured against the *tracklet* motion
+(clean ground truth, isolating the shield's reasoning from perception); label-free is the
+characterised perception gap it must eventually close. `dynamics.py` unit tests pin the estimator
+on synthetic occupancy where truth is exact.
 
 Reproduce: `python3 scripts/eval_dynamics.py --window 4 --coherence 0.8 --min-speed 1.5`.
+
+### The dynamic shield — braking for where an obstacle is going
+
+`dynamics.dynamic_safety_shield` is `vehicle.safety_shield` with the clearance checks
+**time-indexed**: through the full braking rollout the obstacles are advanced along their
+velocity (`box_at(t)`), so the certificate is "can I stop clear of where the obstacles *will
+be*," not where they are now. Same inductive structure, same held-steer fallback; the guarantee
+is sound *to the extent the constant-velocity prediction holds*, which is the honest scope of any
+behaviour-predicting planner (cf. RSS's bounded-behaviour assumption) — an obstacle predicted to
+cut inside the stopping envelope trips `ics`, as it must.
+
+The difference from the static shield is demonstrated, not asserted. In a crossing scenario — a
+car sweeping across the lane, timed to arrive as the ego does — the **static shield drives into
+it** (it brakes only once the car is already in the lane, too late) while the **dynamic shield
+stops clear** (`test_static_shield_hits_a_crossing_car_that_the_dynamic_shield_avoids`), the
+moving-obstacle analogue of the braking-vs-one-step demonstration.
+
+On real traffic, comparing static vs dynamic **permitted speed** at the ego across drive 0009's
+12 labelled movers (tracklet velocity, actor lifted out of the static occupancy and re-inserted
+as a constant-velocity box):
+
+| | mover-frames | worst gap |
+| --- | ---: | ---: |
+| dynamic **more conservative** (a car entering the path) | 8% (34/421) | **−8.3 m/s** |
+| more permissive (a car that has left) | 0% | — |
+| unchanged (mover not in the path) | 92% | — |
+
+So on 92% of frames the moving obstacle is beside or behind the ego and nothing changes — but on
+the 8% where a car crosses in, the dynamic shield gives up as much as 8.3 m/s of permitted speed
+that the static shield would have kept, driving straight toward where the car is heading. That
+8% is the whole point: it is exactly the set of frames where treating a moving world as frozen is
+a safety error.
+
+Reproduce: `python3 scripts/eval_dynamic_shield.py`.
 
 ## Reproduce
 
 ```bash
-# label-free obstacle velocity, graded against tracklets
+# label-free obstacle velocity, graded against tracklets; then the dynamic shield vs static
 python3 scripts/eval_dynamics.py --window 4 --coherence 0.8 --min-speed 1.5
+python3 scripts/eval_dynamic_shield.py
 
 # accumulated mapping (the table above; --audit-ego re-derives the self-filter box)
 python3 scripts/eval_mapping.py --sweep 1 2 3 5 10 20 --every 12 --max-speed 21
