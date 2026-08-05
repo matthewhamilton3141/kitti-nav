@@ -28,7 +28,7 @@ Runs entirely on a laptop — pure NumPy + OpenCV, no GPU, no simulator install.
 | Cautious speed cap on unknown space | done — **honest map drivable: 4% → ~37% success, shield still 0 collisions** |
 | Object tracklets crediting carving | done — **0009 has 12 real movers; carving retires 9% of trail, keeps 96% of the actor** |
 
-**174 tests pass.** Dataset-backed tests skip cleanly when KITTI isn't downloaded; the
+**181 tests pass.** Dataset-backed tests skip cleanly when KITTI isn't downloaded; the
 environment core is pure NumPy and tests without any RL stack installed.
 
 ## Quickstart

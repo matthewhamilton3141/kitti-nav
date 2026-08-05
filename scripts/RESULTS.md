@@ -363,9 +363,49 @@ Four things, in order of how much they matter:
   than assumed. `outside_is_free` remains the optimistic default; the cap is the drivable
   *honest* one.
 
+## Toward dynamic obstacles — label-free velocity is the bottleneck, and it is measured
+
+The shield still treats every obstacle as a frozen wall. Making it reason about *motion* needs
+each obstacle's velocity, and the deployable way to get it is from occupancy alone —
+`dynamics.estimate_obstacle_velocities`, a connected-component tracker over a short window of
+ego-motion-compensated BEV grids that keeps only **temporally coherent** motion (net
+displacement / path length above a threshold). The object tracklets grade it (they are not used
+by the estimator); ground-truth poses remove ego motion, so whatever velocity remains is the
+object's own.
+
+The honest result, scored on drive 0009's 12 moving actors: **when it matches, the velocity is
+good — speed error ~0.55 m/s median, heading ~6°. But detection is only ~35% and the
+false-positive rate is ~95%**, and no operating point escapes it:
+
+| window | min speed | coherence | detection | speed err (med) | false positive |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 2 (pair) | 1.0 | — | 40% | 0.72 m/s | 98% |
+| 4 | 1.5 | 0.8 | 34% | 0.57 m/s | 96% |
+| 5 | 4.0 | 0.85 | 18% | 0.52 m/s | 94% |
+
+Raising the speed floor barely moves the false-positive rate, which is the tell: **the false
+movers are not slow jitter but systematic aspect-change parallax.** As the ego drives past a
+*parked* car (0009 has 89 of them), the lidar sees a different face of it each frame, so the
+footprint's centroid drifts in a consistent direction — apparently-real, coherent motion that
+temporal consistency cannot reject because it *is* consistent. Occupancy-centroid velocity
+fundamentally cannot separate this from a slow-moving vehicle without shape/appearance.
+
+What this means for the shield, stated plainly: **label-free BEV velocity is not clean enough to
+feed a dynamic shield directly** — ~10 phantom movers per frame would have it braking for parked
+cars everywhere. It is sound to build the reachable-set shield against the *tracklet* motion
+(clean ground truth, isolating the shield's reasoning from perception) and to treat the label-free
+estimate as the characterised perception gap it is. The estimator, its accuracy, and its failure
+mode are all in place and measured; the safety reasoning is the next build. `dynamics.py` unit
+tests pin the mechanics on synthetic occupancy where truth is exact.
+
+Reproduce: `python3 scripts/eval_dynamics.py --window 4 --coherence 0.8 --min-speed 1.5`.
+
 ## Reproduce
 
 ```bash
+# label-free obstacle velocity, graded against tracklets
+python3 scripts/eval_dynamics.py --window 4 --coherence 0.8 --min-speed 1.5
+
 # accumulated mapping (the table above; --audit-ego re-derives the self-filter box)
 python3 scripts/eval_mapping.py --sweep 1 2 3 5 10 20 --every 12 --max-speed 21
 python3 scripts/eval_mapping.py --audit-ego

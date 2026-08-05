@@ -8,7 +8,7 @@ notes — what was decided and why, what broke, and what is actually left.
 Option 1 from the previous handoff — "softer unknown semantics, so the honest map is
 drivable" — is **done, and it works**. Hard `unknown_blocks` was sound but unnavigable (4%
 success); the new **cautious speed cap** lifts that to **34–40%** while the shield stays at **0
-collisions on every shielded row**. On `feat/map-fusion`, pushed, **174 tests green**.
+collisions on every shielded row**. On `feat/map-fusion`, pushed, **181 tests green**.
 
 What was built, and the two decisions inside it:
 
@@ -71,6 +71,31 @@ dynamic-obstacle shield scenario will want.
 
 Reproduce: `python3 scripts/eval_carving_credit.py --window 5 --persistence 2`.
 
+## And this sitting: dynamic obstacles started — label-free velocity is the wall (checkpoint)
+
+Began option 3 (dynamic obstacles) with the design the user picked: **label-free** motion (from
+occupancy, not labels) feeding a **constant-velocity** reachable set. Stage 1 — the label-free
+velocity estimator — is built, tested, and **honestly characterised as the bottleneck**:
+
+- `dynamics.estimate_obstacle_velocities(occ_window, …)` tracks occupancy connected-components
+  across a short ego-compensated window and keeps only **temporally coherent** motion
+  (net/path displacement ratio). `scripts/eval_dynamics.py` grades it against the tracklets.
+- **Result: ~35% detection at ~95% false positive, at every operating point.** When it matches,
+  velocity is good (~0.55 m/s speed error, ~6° heading). The FPs are **not** slow jitter —
+  raising the speed floor barely moves them — they are **aspect-change parallax**: driving past a
+  parked car (0009 has 89), the lidar sees a new face each frame, so its centroid drifts
+  coherently and reads as real motion. Occupancy-centroid velocity cannot separate that from a
+  slow vehicle without shape/appearance. Full table in `scripts/RESULTS.md`.
+- **Implication for stage 2 (the shield):** a 95%-FP feed would have the shield braking for
+  parked cars everywhere — undriveable. The sound path is to build the **reachable-set shield
+  against tracklet motion** (clean ground truth, isolates the safety reasoning from perception)
+  and treat label-free as the measured perception gap. **This is the open decision left for the
+  next session / the user** — it revisits the "label-free" choice now that we know its FP rate.
+  The estimator stays useful either way (the shield brakes conservatively for any mover, so a
+  false positive costs speed, not safety).
+
+Reproduce: `python3 scripts/eval_dynamics.py --window 4 --coherence 0.8 --min-speed 1.5`.
+
 ## ⚠ Read first: the tree is not where you'd assume
 
 **All the mapping/carving work is on `feat/map-fusion`, pushed, and NOT merged to `main`.**
@@ -119,7 +144,7 @@ The seed idea was `gsplat-rt`'s nav capstone: a hard safety shield wrapping any 
 question was whether it survives contact with *driving*. Mostly it did — but almost nothing
 ported unchanged, and one of its headline results did not reproduce (below).
 
-## Status — **174 tests green** (on `feat/map-fusion`; `main` is at 105)
+## Status — **181 tests green** (on `feat/map-fusion`; `main` is at 105)
 
 | milestone | state | measured |
 | --- | --- | --- |
@@ -447,7 +472,7 @@ about **motion**, for which the tracklet infra is now in place.
 ## Commands worth knowing
 
 ```bash
-python3 -m pytest tests/ -q                     # 174 green; dataset tests skip without KITTI
+python3 -m pytest tests/ -q                     # 181 green; dataset tests skip without KITTI
 
 # object tracklets: fetch the labels (tiny), then credit carving's de-smear on real movers
 python3 scripts/fetch_kitti.py --tracklets
