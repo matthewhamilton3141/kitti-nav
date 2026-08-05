@@ -57,15 +57,15 @@ holes, so anything iterating lidar bounds on `n_velodyne`.)
 ## What this takes from gsplat-rt, and what it doesn't
 
 This repo is a deliberate branch off [**gsplat-rt**](https://github.com/matthewhamilton3141/gsplat-rt),
-a real-time TensorRT Gaussian-splat SLAM project by the same author. That project ended with
-two finished arcs: a VGGT-style reconstruction model taken to TensorRT (1.187× whole-model
-speedup from two compounding levers), and a navigation-RL flagship whose capstone result was
-that **training a policy through a hard safety shield dominated the unshielded policy on
-every axis** (100% success / 0 collisions / fewer steps, vs 98% / 4 / more).
+my earlier real-time TensorRT Gaussian-splat SLAM project. I left it at two finished arcs: a
+VGGT-style reconstruction model taken to TensorRT (1.187× whole-model speedup from two compounding
+levers), and a navigation-RL flagship whose capstone result was that **training a policy through a
+hard safety shield dominated the unshielded policy on every axis** (100% success / 0 collisions /
+fewer steps, vs 98% / 4 / more).
 
-That shield result is the seed of this repo. The interesting question was whether the idea
-survives contact with *driving* — a different vehicle, different speeds, different sensors.
-Mostly it did, but almost nothing transferred unchanged.
+That shield result is the seed of this repo. What I wanted to know was whether the idea survives
+contact with *driving* — a different vehicle, different speeds, different sensors. Mostly it did,
+but almost nothing transferred unchanged.
 
 ### Reused as-is (the design, not the code)
 
@@ -74,9 +74,9 @@ Mostly it did, but almost nothing transferred unchanged.
   `src/isaac/nav_sim.py` set the shape of `vehicle.py`.
 - **One integrator, shared by the simulator and the shield's lookahead.** A filter that
   predicts differently than the world integrates is unsound, so `step_state` is used by both.
-- **Pure-NumPy, laptop-testable cores.** gsplat-rt's discipline of keeping the durable logic
-  free of GPU/torch/gym dependencies is what makes this repo runnable with no setup.
-- **The pluggable front-end seam** in the odometry. gsplat-rt used exactly this to swap ORB
+- **Pure-NumPy, laptop-testable cores.** The discipline I kept in gsplat-rt — durable logic free
+  of GPU/torch/gym dependencies — is what makes this repo runnable with no setup.
+- **The pluggable front-end seam** in the odometry. I used exactly this in gsplat-rt to swap ORB
   for a TensorRT SuperPoint+LightGlue front-end without touching any geometry.
 - **Measure, don't assume; correct claims downward.** Every number in this README was
   produced by a script in `scripts/`.
@@ -96,14 +96,14 @@ Mostly it did, but almost nothing transferred unchanged.
 faithfully and **drives it into a wall**, in the same scene where the rebuilt shield stops
 clean. The failure is demonstrated, not asserted.
 
-**Stereo deleted an entire subsystem.** gsplat-rt estimated depth with a monocular network,
+**Stereo deleted an entire subsystem.** In gsplat-rt I estimated depth with a monocular network,
 whose output is only defined up to scale — it needed a whole `monocular_scale.py` stage, and
 residual scale drift dominated its error. Here `depth = fx·b/disparity` is metric by
 construction. Nothing to estimate, nothing to drift. Consequently the evaluation applies **no
 Sim(3) alignment**: fitting a scale factor is correct for monocular VO and would be
 self-flattery here.
 
-**Circular obstacles became an occupancy grid.** gsplat-rt's world was circles on a plane.
+**Circular obstacles became an occupancy grid.** In gsplat-rt the world was circles on a plane.
 Real lidar is not, so the shield now talks to an `ObstacleField` interface, and `BEVGrid`
 implements it directly. Occupancy is never approximated by circles — that would discard
 exactly the arbitrary shape occupancy represents well.
@@ -434,7 +434,7 @@ one drive — this is within-drive generalisation to a later stretch, not cross-
 ### A negative result, replicated across 5 training seeds
 
 **Training through the shield did not beat simply bolting it on at evaluation — contradicting
-what gsplat-rt found.** There, shield-in-the-loop strictly dominated (100%/0/56 vs 98%/4/58).
+what I found in gsplat-rt.** There, shield-in-the-loop strictly dominated (100%/0/56 vs 98%/4/58).
 
 This is a claim about a *training method*, so the unit of replication has to be the training
 run, not the episode — a single run cannot separate a real effect from one lucky weight
@@ -451,7 +451,7 @@ Neither is significant, and **0 collisions in all 10 runs**.
 The interval matters more than the p-value here. On KITTI it caps any real effect at **+2.7
 points**, and 4 of 5 seeds do favour in-loop training — so a small genuine benefit isn't
 excluded, and "not significant" isn't "no effect." What *is* excluded is anything near the
-magnitude gsplat-rt reported. The defensible claim: **not that in-loop training never helps,
+magnitude I measured in gsplat-rt. The defensible claim: **not that in-loop training never helps,
 but that its large win there does not reproduce here.**
 
 Why: eval-time shielding already costs this policy nothing (on synthetic scenes it *helps*),
