@@ -125,6 +125,12 @@ class VehicleConfig:
     safety_margin: float = 0.30    # clearance (m) the shield keeps free
     n_accel_candidates: int = 11   # throttle/brake levels searched, commanded -> full brake
     max_brake_steps: int = 200     # hard cap on the braking rollout horizon
+    # Evasive steering: when neither the commanded nor the held wheel angle can certify a stop,
+    # search this many steer angles across the full range for one whose braking rollout *is*
+    # clear — swerving out of an otherwise-inevitable collision instead of braking blindly into
+    # it. 0 (the default) disables it, so the shield's two-option behaviour and every number
+    # measured against it are unchanged unless a caller opts in.
+    n_evasive_steers: int = 0
 
     @property
     def front_overhang(self) -> float:
@@ -267,6 +273,27 @@ class ShieldResult:
         return np.array([self.accel, self.steer], np.float32)
 
 
+def evasive_steer_candidates(steer_cmd: float, state_steer: float,
+                             cfg: VehicleConfig) -> np.ndarray:
+    """Steer angles to try when neither the commanded nor held angle can certify a stop.
+
+    A fan across the full steering range, ordered by proximity to the commanded angle so the
+    shield prefers the smallest swerve away from the driver's intent, with the two angles the
+    main search already covered (commanded, held) dropped. Empty when evasive steering is off
+    (`n_evasive_steers == 0`, the default), so the shield is exactly its two-option self unless
+    a caller opts in. The rate limiter in `step_state` means a large angle here is a *command*,
+    realised as at most one step's slew — the shield reasons about the curved braking path that
+    actually results, not an instantaneous heading change.
+    """
+    n = int(cfg.n_evasive_steers)
+    if n <= 0:
+        return np.empty(0, float)
+    fan = np.linspace(-cfg.max_steer, cfg.max_steer, n)
+    fresh = np.array([s for s in fan
+                      if not (np.isclose(s, steer_cmd) or np.isclose(s, state_steer))], float)
+    return fresh[np.argsort(np.abs(fresh - steer_cmd))]
+
+
 def safety_shield(accel_cmd: float, steer_cmd: float, state: VehicleState,
                   obstacles: Obstacles, cfg: VehicleConfig) -> ShieldResult:
     """Hard braking-aware safety filter over a commanded `(accel, steer)`.
@@ -283,12 +310,20 @@ def safety_shield(accel_cmd: float, steer_cmd: float, state: VehicleState,
     previous step's certificate guarantees a safe stop exists. Passing the commanded steer
     through unconditionally is unsound, and was a real bug here (see the module docstring).
 
+    **Evasive steering (opt-in, `cfg.n_evasive_steers > 0`).** If neither the commanded nor
+    the held angle can certify a stop — the situation the shield would otherwise meet by
+    braking blindly and flagging `ics` — it then searches a fan of steer angles for one whose
+    braking rollout *is* clear, and swerves rather than crashing. This stays sound because
+    every candidate is admitted only through the same `can_stop_safely` certificate (issued
+    under the very angle it commands), so the successor still carries a held-steer braking
+    trajectory and the induction is untouched; it can only convert collisions into safe stops,
+    never the reverse. Ordered to prefer the smallest swerve, then the most speed.
+
     A runtime layer over *any* policy — learned or hand-written — needing no retraining.
-    If even held-steer maximum braking fails to certify, the state is already an
-    inevitable-collision state (only reachable by starting from an uncertified state, or
-    from an obstacle appearing inside the stopping envelope); the shield then commands
-    maximum braking as the best available action and flags `ics=True` rather than
-    pretending the situation is safe.
+    If even that fails to certify, the state is already an inevitable-collision state (only
+    reachable by starting from an uncertified state, or from an obstacle appearing inside the
+    stopping envelope); the shield then commands maximum braking, holding steer, as the best
+    available action and flags `ics=True` rather than pretending the situation is safe.
     """
     field = as_field(obstacles)              # coerce once, then reuse across every candidate
     hi = float(np.clip(accel_cmd, -cfg.max_decel, cfg.max_accel))
@@ -309,6 +344,15 @@ def safety_shield(accel_cmd: float, steer_cmd: float, state: VehicleState,
                 intervened = not (np.isclose(a, hi) and np.isclose(steer, steer_cmd))
                 return ShieldResult(accel=float(a), steer=float(steer),
                                     intervened=bool(intervened), ics=False)
+
+    # Neither commanded nor held steer left a certifiable stop: swerve before giving up.
+    for steer in evasive_steer_candidates(steer_cmd, state.steer, cfg):
+        for a in accels:
+            nxt = step_state(state, float(a), float(steer), cfg)
+            if clearance(nxt, field, cfg) >= cfg.safety_margin and \
+                    can_stop_safely(nxt, field, cfg):
+                return ShieldResult(accel=float(a), steer=float(steer),
+                                    intervened=True, ics=False)
 
     return ShieldResult(accel=lo, steer=state.steer, intervened=True, ics=True)
 

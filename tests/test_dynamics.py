@@ -162,3 +162,21 @@ def test_can_stop_safely_dynamic_refuses_a_stop_that_an_obstacle_crosses_into():
     crossing = [MovingObstacle(box, np.array([0.0, 3.5]))]
     assert can_stop_safely_dynamic(state, None, frozen, vcfg)
     assert not can_stop_safely_dynamic(state, None, crossing, vcfg)
+
+
+def test_dynamic_shield_swerves_for_a_predicted_path_it_cannot_brake_for():
+    """Evasive steering carries into the dynamic shield: a car it can't brake for, it steers past.
+
+    A vehicle 16 m ahead while doing 13 m/s — inside the stopping distance, so braking against
+    its predicted path is an ICS — with the lane beside it open. With evasive steering off the
+    dynamic shield brakes and declares the ICS; with it on the shield certifies a swerve instead.
+    """
+    state = VehicleState(x=0.0, y=0.0, yaw=0.0, v=13.0, steer=0.0)
+    mover = [MovingObstacle(np.array([16.0, 0.0, 0.0, 3.0, 1.8]), np.array([0.0, 0.2]))]
+
+    braking = dynamic_safety_shield(2.0, 0.0, state, None, mover, VehicleConfig())
+    assert braking.ics and braking.steer == pytest.approx(0.0)
+
+    evasive = dynamic_safety_shield(2.0, 0.0, state, None, mover,
+                                    VehicleConfig(n_evasive_steers=15))
+    assert not evasive.ics and abs(evasive.steer) > 0.0

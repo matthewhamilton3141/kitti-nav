@@ -29,8 +29,9 @@ Runs entirely on a laptop — pure NumPy + OpenCV, no GPU, no simulator install.
 | Object tracklets crediting carving | done — **0009 has 12 real movers; carving retires 9% of trail, keeps 96% of the actor** |
 | Dynamic shield (braking for a moving obstacle's path) | done — **static shield crashes a crossing car it stops clear of; binds on 8% of real mover-frames** |
 | Closed-loop dynamic traffic (movers step while a policy drives) | done — **on 0009's crossing cars the static shield drives in 51×, the dynamic shield 4×; its residual hits are movers striking a stopped ego, all ics-flagged** |
+| Evasive steering (swerve out of an ICS rather than brake into it) | done, opt-in — **cleanly avoids an open-road obstacle it can't brake for; marginal on cluttered real traffic (46 → 45)** |
 
-**190 tests pass.** Dataset-backed tests skip cleanly when KITTI isn't downloaded; the
+**195 tests pass.** Dataset-backed tests skip cleanly when KITTI isn't downloaded; the
 environment core is pure NumPy and tests without any RL stack installed.
 
 ## Quickstart
@@ -139,10 +140,27 @@ holding the last certified steer, which induction guarantees is stoppable. Kept 
 I would not have found this by hand — every scenario worth writing by hand has the policy
 steering sensibly. It is the argument for property-based testing in one bug.
 
-**Stated limitations:** the shield chooses between the commanded steer and the held steer; it
-never searches for an *evasive* one, so it brakes for obstacles it might have swerved around.
-The footprint is a conservative disc cover, which inflates the car ~0.12 m per side and ~0.55 m
-past each bumper.
+**Stated limitations:** by default the shield chooses between the commanded steer and the held
+steer and otherwise brakes. Opt-in **evasive steering** (`n_evasive_steers > 0`) removes that
+restriction — see below. The footprint is a conservative disc cover, which inflates the car
+~0.12 m per side and ~0.55 m past each bumper.
+
+### Evasive steering
+
+When neither the commanded nor the held wheel angle can certify a stop — the situation the shield
+would otherwise meet by braking blindly and flagging an inevitable-collision state — an opt-in
+third pass searches a fan of steer angles for one whose braking rollout *is* clear, and swerves
+instead of crashing. It stays sound because every candidate is admitted through the same
+`can_stop_safely` certificate, issued under the very angle it commands, so the successor still
+carries a held-steer braking trajectory and the induction is untouched; it can only convert
+collisions into safe stops. On an open road it works cleanly — doing 13 m/s at a car 16 m ahead
+(inside the ~19 m stopping distance, an ICS for braking), the braking-only shield drives in while
+the evasive shield steers past with margin to spare (`test_evasive_steering_avoids_a_collision…`).
+On **real** 0009 traffic the gain is small (dynamic-shield collisions 46 → 45 over 200 episodes):
+the residual collisions there are mostly a mover striking an *already-stopped* ego, and a real
+street is laterally cluttered, so the room a swerve needs is usually already occupied. Off by
+default; the rate limiter in `step_state` means a large angle is a command realised as a sustained
+brake-turn, not an instant heading change.
 
 ### Reasoning about motion
 

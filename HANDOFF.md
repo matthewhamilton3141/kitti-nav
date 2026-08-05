@@ -7,12 +7,17 @@ notes — what was decided and why, what broke, and what is actually left.
 
 # ▶ START HERE — next step for a cleared session
 
-**Where things stand.** **190 tests green** (`python3 -m pytest tests/ -q`; dataset tests skip
-without KITTI). The **closed-loop dynamic env (option 3a) is DONE and committed** — see the
-session note directly below this block. **`main` was fast-forwarded to `feat/map-fusion` and
-pushed**, so the long-standing "the tree is not where you'd assume" divergence is **resolved**:
-`main` and `feat/map-fusion` are now the same commit (`12f6d73`), both on origin. Latest commits,
-newest first:
+**Where things stand.** **195 tests green** (`python3 -m pytest tests/ -q`; dataset tests skip
+without KITTI). Two things done since the last clear, both on `feat/map-fusion` = `main` (they
+coincide — the old divergence was resolved by a fast-forward, `02a1098..12f6d73`, and pushed):
+
+1. **Closed-loop dynamic env (option 3a) — DONE and committed** (`12f6d73`). Session note below.
+2. **Evasive steering in the shield (option 5) — DONE, uncommitted at time of writing.** The
+   working tree has changes to `vehicle.py`, `dynamics.py`, `test_vehicle.py`, `test_dynamics.py`,
+   `eval_dynamic_policies.py`, plus doc updates (README / RESULTS / this file). See the session
+   note directly below. Committing is the first action for whoever picks this up.
+
+Latest committed commits, newest first:
 
 ```
 12f6d73 feat: closed-loop dynamic env — static vs dynamic shield on moving traffic
@@ -24,9 +29,34 @@ ff5c2c0 feat: label-free BEV obstacle-velocity estimation (stage 1)
 Everything below the `▶` block is the deep record (session write-ups, then decisions, bugs,
 gaps, env facts). Read this block, then dip into those as needed — they are accurate and current.
 
-**The branch/`main` decision is settled: it was a fast-forward, not a PR** (the "⚠ Read first"
-section below is now historical). The repo is back to a single up-to-date line; keep working on
-`feat/map-fusion` (or `main` — they coincide) as you prefer.
+## ✅ DONE this session: evasive steering in the shield (option 5)
+
+The shield could only brake or hold; now it can **swerve out of an inevitable collision**. Added
+`vehicle.n_evasive_steers` (default **0** = off, so every prior number reproduces) and a third
+search pass in **both** `vehicle.safety_shield` and `dynamics.dynamic_safety_shield`: when neither
+the commanded nor the held steer certifies a stop (what would otherwise be an ICS), search a fan
+of steer angles (`vehicle.evasive_steer_candidates`, ordered by proximity to the commanded angle)
+for one whose braking rollout *is* clear, and take it. **Sound** — each candidate is admitted via
+the same `can_stop_safely` certificate under the very angle it commands, so the successor still
+carries a held-steer braking trajectory and the induction is untouched; it can only turn a
+collision into a safe stop.
+
+- **Open road: works cleanly.** 13 m/s at a lone car 16 m ahead (inside the ~18.8 m stopping
+  distance → ICS for braking) — braking-only drives in, evasive swerves clear. Pinned by
+  `test_evasive_steering_avoids_a_collision_the_braking_shield_drives_into` (+ the dynamic twin).
+- **Real 0009 traffic: marginal, and honestly so.** Dynamic-shield collisions 46 → 45 over 200
+  episodes. Two real reasons: residual collisions are dominated by "run into" (a mover striking an
+  already-*stopped* ego — no forward escape to steer into), and real streets are laterally
+  cluttered so the space a swerve needs is usually occupied. Full write-up in `scripts/RESULTS.md`
+  ("Evasive steering — … where it does and doesn't help"). Reproduce:
+  `python3 scripts/eval_dynamic_policies.py --episodes 200 --evasive 15` (slow — the evasive
+  search adds ~13 steer × 11 accel braking rollouts per ICS decision).
+
+**Do not re-litigate:** the marginal real-traffic result is the honest finding, not a bug to fix.
+The rate limiter in `step_state` (0.06 rad/step) means a large evasive angle is a *command*
+realised as a sustained brake-turn, and `can_stop_safely` certifies the (conservative) constant
+single-step-angle curve — sound but gentle, which is part of why cluttered streets rarely admit a
+swerve. Off by default was chosen for reproducibility, matching every other additive feature here.
 
 ## ✅ DONE this session: the closed-loop dynamic env (option 3a)
 
@@ -266,7 +296,8 @@ ported unchanged, and one of its headline results did not reproduce (below).
 | **Cautious speed cap + unknown hole-closing** | done — *on the branch* | **honest map drivable: hard-block 4% → cap 34–40% success; shield still 0 collisions; corridor 10→21 m** |
 | **Object tracklets + carving credited by labels** | done — *on the branch* | **0009 has 12 real movers (not "too static"); carving retires 9% of trail keeping 96% of the present actor** |
 | **Dynamic shield: braking for an obstacle's predicted path** | done — *on the branch* | **static shield crashes a crossing car the dynamic one stops clear of; binds on 8% of real mover-frames (worst −8.3 m/s)** |
-| **Closed-loop dynamic env: movers step while a policy drives** | done — *on the branch, uncommitted* | **on 0009's 91 crossing encounters the static shield drives in 51×, the dynamic shield 4×; residual hits are movers striking a stopped ego, all ics-flagged** |
+| **Closed-loop dynamic env: movers step while a policy drives** | done — *on the branch* | **on 0009's 91 crossing encounters the static shield drives in 51×, the dynamic shield 4×; residual hits are movers striking a stopped ego, all ics-flagged** |
+| **Evasive steering: swerve out of an ICS instead of braking into it** | done, opt-in — *on the branch, uncommitted* | **open-road: cleanly avoids an obstacle it can't brake for; real traffic: marginal (dyn-shield coll 46→45), room to swerve usually absent** |
 
 Full numbers: `README.md` and `scripts/RESULTS.md`.
 
@@ -515,8 +546,12 @@ Seed spread was small (1.0–2.9 pts), unusually low for deep RL. Sweep cost ~35
 - **The grid cannot certify above 21.2 m/s.** `sqrt(2 · 4.5 · 50)`. Any permitted speed above
   that is `outside_is_free` talking, not the sensor — which is why `eval_mapping.py` caps at 21
   while `render_bev.py` still uses 35. Worth reconciling.
-- **The shield never steers evasively.** It picks between the commanded steer and the held
-  steer and otherwise brakes; it will brake for something it could have swerved around.
+- **Evasive steering exists now but is opt-in and narrow.** `n_evasive_steers > 0` lets the
+  shield swerve out of an ICS (sound; both shields); it works cleanly on an open road but is
+  marginal on real cluttered traffic (46→45 dyn-shield collisions), because the room to swerve is
+  usually occupied and most residual hits are movers striking a *stopped* ego. Off by default. The
+  open question it leaves: a less conservative evasive certificate (a *sustained* brake-turn, not a
+  constant single-step angle) could admit sharper swerves — but that is more theory than wiring.
 - **The footprint disc cover is conservative** — inflates the car ~0.12 m per side and ~0.55 m
   past each bumper. Real cost: at frame 294 it permits 3.4 m/s where the human drove 10.0,
   threading parked cars with 0.03 m modelled clearance.
@@ -531,12 +566,13 @@ Seed spread was small (1.0–2.9 pts), unusually low for deep RL. Sweep cost ~35
 
 ## What next — options
 
-**Update: (3a) is now done** — the closed-loop dynamic env is built and the moving-world table
-measured (static shield drives in 51×, dynamic 4×, on 0009's 91 crossing encounters; see the
-START HERE session note). Options 1, 2, and 3 are all done. **My recommendation now: resolve the
-branch/`main` thread first (see ⚠ Read first), then evasive steering (option 5)** — the shield
-only brakes, so it can't dodge a crossing car it might have steered around, which is the most
-*new* headline still available.
+**Update: options 1, 2, 3 (incl. 3a closed-loop) and 5 (evasive steering) are all done**, and the
+branch/`main` divergence is resolved (fast-forward). See the two START HERE session notes.
+**My recommendation now: (7) train a policy on fused/dynamic KITTI geometry, or (6) strengthen VO.**
+Every policy here is still trained on synthetic scenes only — training on accumulated or dynamic
+maps is the obvious untried lever and the likely way to recover the 12–14 points fusion cost.
+Evasive steering's open extension (a sustained-brake-turn certificate) is the one *new-theory*
+item left in the shield itself, but it is niche given how cluttered real streets are.
 
 1. **✅ DONE — softer unknown semantics, so the honest map is drivable.** The **cautious speed
    cap** plus **hole-closing** takes hard-block's 4% to 34–40% with the shield still at 0
@@ -554,7 +590,10 @@ only brakes, so it can't dodge a crossing car it might have steered around, whic
    `eval_dynamic_policies.py`: static shield drives into a crossing car 51× vs the dynamic
    shield's 4× (200 episodes). See the START HERE session note. *Optional (3b):* better label-free
    perception (scene-flow with shape, or a learned head) to close the stage-1 gap.
-5. Evasive steering in the shield (search over steer candidates, not just two).
+5. **✅ DONE (opt-in) — evasive steering in the shield.** `n_evasive_steers > 0` searches a fan
+   of steer candidates when braking can't certify a stop, swerving out of an ICS; sound, in both
+   shields. Clean on an open road, marginal on real cluttered traffic (see the START HERE note and
+   `scripts/RESULTS.md`). Open extension: a sustained-brake-turn certificate for sharper swerves.
 6. Strengthen VO: local bundle adjustment or keyframing; SuperPoint+LightGlue front-end beat
    ORB in `gsplat-rt` (3.5 cm vs 5.7 cm ATE on TUM) but is box-gated. Note the mapping result
    lowers the priority of this: fusion is governed by *within-window* relative error, which is
@@ -594,6 +633,7 @@ python3 scripts/eval_carving_credit.py --window 5 --persistence 2
 python3 scripts/eval_dynamics.py --window 4 --coherence 0.8 --min-speed 1.5
 python3 scripts/eval_dynamic_shield.py                   # open-loop: static vs dynamic permitted speed
 python3 scripts/eval_dynamic_policies.py --episodes 200  # closed-loop: static vs dynamic shield on movers
+python3 scripts/eval_dynamic_policies.py --episodes 200 --evasive 15  # + the evasive-steering row (slow)
 
 # mapping: the sweep behind the accumulated-map table, and the ego self-filter audit
 python3 scripts/eval_mapping.py --sweep 1 2 3 5 10 20 --every 12 --max-speed 21

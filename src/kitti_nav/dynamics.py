@@ -38,6 +38,7 @@ from .vehicle import (
     ShieldResult,
     VehicleConfig,
     VehicleState,
+    evasive_steer_candidates,
     footprint_discs,
     step_state,
 )
@@ -247,11 +248,18 @@ def dynamic_safety_shield(accel_cmd: float, steer_cmd: float, state: VehicleStat
 
     Where the static shield sees only where an obstacle *is*, this brakes for where it is
     *going*, which is the difference between stopping short of a car crossing ahead and driving
-    into where it will be. Falls back to held-steer maximum braking with `ics=True` when even
-    that cannot certify — an obstacle predicted to cut inside the stopping envelope.
+    into where it will be. With `cfg.n_evasive_steers > 0` it also **swerves** for a predicted
+    path it cannot brake clear of — the moving-world case that matters most, since a car cutting
+    in is exactly what braking alone cannot always escape. Falls back to held-steer maximum
+    braking with `ics=True` only when neither slowing nor steering can certify a clear stop.
     """
     hi = float(np.clip(accel_cmd, -cfg.max_decel, cfg.max_accel))
     accels = np.linspace(hi, -cfg.max_decel, max(int(cfg.n_accel_candidates), 2))
+
+    def admissible(steer: float, a: float) -> bool:
+        nxt = step_state(state, float(a), float(steer), cfg)
+        return (moving_clearance(nxt, static_field, movers, cfg, cfg.dt) >= cfg.safety_margin
+                and can_stop_safely_dynamic(nxt, static_field, movers, cfg, t0=cfg.dt))
 
     steer_options = [steer_cmd]
     if not np.isclose(steer_cmd, state.steer):
@@ -259,12 +267,19 @@ def dynamic_safety_shield(accel_cmd: float, steer_cmd: float, state: VehicleStat
 
     for steer in steer_options:
         for a in accels:
-            nxt = step_state(state, float(a), float(steer), cfg)
-            if (moving_clearance(nxt, static_field, movers, cfg, cfg.dt) >= cfg.safety_margin
-                    and can_stop_safely_dynamic(nxt, static_field, movers, cfg, t0=cfg.dt)):
+            if admissible(steer, a):
                 intervened = not (np.isclose(a, hi) and np.isclose(steer, steer_cmd))
                 return ShieldResult(accel=float(a), steer=float(steer),
                                     intervened=bool(intervened), ics=False)
+
+    # Neither commanded nor held steer leaves a certifiable stop against the predicted paths:
+    # swerve before giving up. Sound for the same reason as the static shield's evasive pass —
+    # every candidate carries its own dynamic braking certificate.
+    for steer in evasive_steer_candidates(steer_cmd, state.steer, cfg):
+        for a in accels:
+            if admissible(steer, a):
+                return ShieldResult(accel=float(a), steer=float(steer),
+                                    intervened=True, ics=False)
 
     return ShieldResult(accel=-cfg.max_decel, steer=state.steer, intervened=True, ics=True)
 

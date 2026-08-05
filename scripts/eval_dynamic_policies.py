@@ -62,9 +62,12 @@ def load_ppo(path: Path):
 
 
 def evaluate_dynamic(scenes, policy, *, use_shield: bool, dynamic: bool,
-                     n_episodes: int, seed: int = 0) -> dict:
+                     n_episodes: int, seed: int = 0, n_evasive: int = 0) -> dict:
     """Roll `policy` over the dynamic scenes, tallying how each mover-collision happened."""
-    cfg = DynamicNavConfig(use_shield=use_shield, dynamic_shield=dynamic)
+    from kitti_nav.vehicle import VehicleConfig
+
+    cfg = DynamicNavConfig(use_shield=use_shield, dynamic_shield=dynamic,
+                           vehicle=VehicleConfig(n_evasive_steers=n_evasive))
     env = DynamicNavEnv(scenes, cfg)
 
     reached = collided = mover_hits = drove_in = run_into = ics_hits = 0
@@ -113,6 +116,9 @@ def main() -> int:
                    help="also score a saved PPO policy (else gap-following only)")
     p.add_argument("--min-lateral-speed", type=float, default=1.0,
                    help="crossing speed (m/s) for a mover-frame to count as an encounter")
+    p.add_argument("--evasive", type=int, default=0, metavar="N",
+                   help="also add a dynamic-shield row that swerves (N steer candidates) when "
+                        "braking cannot certify a stop; 0 disables it")
     args = p.parse_args()
 
     from kitti_nav.kitti import KittiDrive
@@ -128,20 +134,27 @@ def main() -> int:
     if args.ppo is not None:
         policies.append((f"PPO ({args.ppo.name})", load_ppo(args.ppo)))
 
+    # (label, use_shield, dynamic, n_evasive); the evasive row is opt-in via --evasive.
+    conditions = [("unshielded", False, False, 0),
+                  ("static shield", True, False, 0),
+                  ("dynamic shield", True, True, 0)]
+    if args.evasive > 0:
+        conditions.append(("dynamic + evasive", True, True, args.evasive))
+
     for name, pol in policies:
         print(f"{name}:")
-        for label, use_shield, dyn in (("unshielded", False, False),
-                                       ("static shield", True, False),
-                                       ("dynamic shield", True, True)):
+        for label, use_shield, dyn, ev in conditions:
             r = evaluate_dynamic(scenes, pol, use_shield=use_shield, dynamic=dyn,
-                                 n_episodes=args.episodes, seed=args.seed)
+                                 n_episodes=args.episodes, seed=args.seed, n_evasive=ev)
             print(_row(label, r))
         print()
 
     print("'drove in' = the shield steered the ego into the crossing mover (the failure the\n"
           "dynamic shield removes); 'run into' = the ego had stopped clear and the mover drove\n"
           "into it (unavoidable by braking, and correctly ics-flagged). The dynamic shield's\n"
-          "guarantee is sound to the extent the constant-velocity prediction holds.")
+          "guarantee is sound to the extent the constant-velocity prediction holds. With\n"
+          "--evasive the shield may swerve out of an ICS rather than brake into it; on real\n"
+          "cluttered traffic the room to do so is usually absent, so the gain is small.")
     return 0
 
 

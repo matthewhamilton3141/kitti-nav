@@ -468,6 +468,37 @@ documented scope of a behaviour-predicting shield, not a soundness hole.
 
 Reproduce: `python3 scripts/eval_dynamic_policies.py --episodes 200`.
 
+### Evasive steering — swerving out of an ICS, and where it does and doesn't help
+
+Both shields default to two steering options (commanded, held) and otherwise brake. An opt-in
+third pass (`VehicleConfig.n_evasive_steers > 0`) fires exactly when neither can certify a stop —
+the case that would otherwise be an inevitable-collision state — and searches a fan of steer
+angles for one whose braking rollout *is* clear. It stays sound because every candidate is
+admitted through the same `can_stop_safely` certificate issued under the angle it commands, so the
+successor still carries a held-steer braking trajectory; it can only turn a collision into a safe
+stop, never the reverse. Off by default, so every number above is unchanged.
+
+**On an open road it works cleanly.** Doing 13 m/s at a lone car 16 m ahead — inside the ~18.8 m
+stopping distance, so braking straight is an ICS — the braking-only shield drives in; the evasive
+shield certifies a swerve and clears it with margin (`test_evasive_steering_avoids_a_collision…`,
+and the dynamic-shield twin `test_dynamic_shield_swerves_for_a_predicted_path…`).
+
+**On real 0009 traffic the gain is marginal**, and honestly so:
+
+| gap-following, dynamic shield | collisions | mover-hits | drove in | run into |
+| --- | ---: | ---: | ---: | ---: |
+| braking only | 46 | 34 | 4 | 30 |
+| + evasive (15 steers) | 45 | 33 | 4 | 29 |
+
+Two structural reasons the win is small, both real: the residual collisions are dominated by
+**"run into"** — a mover striking an ego that had already braked to a stop, where there is no
+forward escape to steer into — and a real street is **laterally cluttered** (parked cars, kerbs),
+so the adjacent space a swerve needs is usually already occupied. The clean win is the open-road
+demonstration; on cluttered traffic, braking is almost always what is left. Evasive steering is
+therefore a sound capability with a narrow operating envelope, not a headline on this drive.
+
+Reproduce: `python3 scripts/eval_dynamic_policies.py --episodes 200 --evasive 15`.
+
 ## Reproduce
 
 ```bash

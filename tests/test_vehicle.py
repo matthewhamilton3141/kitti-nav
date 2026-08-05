@@ -8,11 +8,13 @@ import numpy as np
 import pytest
 
 from kitti_nav.vehicle import (
+    CircleField,
     ShieldResult,
     VehicleConfig,
     VehicleState,
     can_stop_safely,
     clearance,
+    evasive_steer_candidates,
     footprint_discs,
     max_safe_speed,
     safety_shield,
@@ -177,6 +179,62 @@ def test_can_stop_safely_agrees_with_the_stopping_distance(cfg):
     obstacles = wall(cfg.front_overhang + d + 2.0, cfg)
     assert can_stop_safely(VehicleState(v=v), obstacles, cfg)
     assert not can_stop_safely(VehicleState(v=v), wall(cfg.front_overhang + d - 2.0, cfg), cfg)
+
+
+# --- evasive steering: swerving out of an otherwise-inevitable collision -----------------
+
+# A lone obstacle 16 m ahead while doing 13 m/s: stopping distance is ~18.8 m, so braking
+# straight cannot stop in time (an ICS), but the lane beside it is open — a swerve clears it.
+_EVASIVE_STATE = VehicleState(x=0.0, y=0.0, yaw=0.0, v=13.0, steer=0.0)
+_EVASIVE_OBSTACLE = CircleField(np.array([[16.0, 0.0, 1.2]]))
+
+
+def test_evasive_steering_is_off_by_default(cfg):
+    """The default shield is its two-option self: it brakes and declares the ICS, never swerves."""
+    assert cfg.n_evasive_steers == 0
+    assert evasive_steer_candidates(0.0, 0.0, cfg).size == 0
+    res = safety_shield(cfg.max_accel, 0.0, _EVASIVE_STATE, _EVASIVE_OBSTACLE, cfg)
+    assert res.ics and res.steer == pytest.approx(0.0)
+
+
+def test_shield_swerves_around_an_obstacle_it_cannot_brake_for():
+    """The headline: with evasive steering on, an ICS becomes a certified swerve, not a crash."""
+    cfg = VehicleConfig(n_evasive_steers=15)
+    res = safety_shield(cfg.max_accel, 0.0, _EVASIVE_STATE, _EVASIVE_OBSTACLE, cfg)
+    assert not res.ics, "a swerve should have been certifiable"
+    assert res.intervened and abs(res.steer) > 0.0, "the shield should have steered away"
+    # The admitted action is genuinely safe: its successor still carries a braking certificate.
+    nxt = step_state(_EVASIVE_STATE, res.accel, res.steer, cfg)
+    assert can_stop_safely(nxt, _EVASIVE_OBSTACLE, cfg)
+
+
+def test_evasive_steering_avoids_a_collision_the_braking_shield_drives_into():
+    """End to end: the same policy (floor it, straight) crashes without evasion, clears with it."""
+    def collided(n_evasive):
+        cfg = VehicleConfig(n_evasive_steers=n_evasive)
+        s = _EVASIVE_STATE
+        for _ in range(120):
+            res = safety_shield(cfg.max_accel, 0.0, s, _EVASIVE_OBSTACLE, cfg)
+            s = step_state(s, res.accel, res.steer, cfg)
+            if clearance(s, _EVASIVE_OBSTACLE, cfg) < 0.0:
+                return True
+            if s.x > 30.0:
+                return False
+        return False
+
+    assert collided(0), "the braking-only shield should drive into the obstacle it cannot stop for"
+    assert not collided(15), "the evasive shield should swerve clear"
+
+
+def test_evasive_steer_candidates_are_ordered_and_exclude_the_tried_angles():
+    cfg = VehicleConfig(n_evasive_steers=9)
+    cand = evasive_steer_candidates(steer_cmd=0.0, state_steer=0.0, cfg=cfg)
+    assert np.all(np.abs(cand) <= cfg.max_steer + 1e-9)
+    # Ordered by proximity to the commanded angle (smallest swerve first).
+    assert np.all(np.diff(np.abs(cand - 0.0)) >= -1e-9)
+    # The two angles the main search already tried are dropped.
+    tried = evasive_steer_candidates(steer_cmd=0.13, state_steer=-0.13, cfg=cfg)
+    assert not np.any(np.isclose(tried, 0.13)) and not np.any(np.isclose(tried, -0.13))
 
 
 # --- why the diff-drive shield could not simply be ported --------------------------------
