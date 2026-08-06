@@ -1,0 +1,740 @@
+# kitti-nav — session handoff (2026-08-04)
+
+Plain-English "pick up here." The README is the polished public account; this is the working
+notes — what was decided and why, what broke, and what is actually left.
+
+---
+
+# ▶ START HERE — next step for a cleared session
+
+**Where things stand.** **197 tests green** (`python3 -m pytest tests/ -q`; dataset tests skip
+without KITTI). Four things done since the last clear, on `feat/map-fusion` = `main` (they
+coincide — the old divergence was resolved by a fast-forward, `02a1098..12f6d73`, and pushed):
+
+1. **Closed-loop dynamic env (option 3a) — DONE and committed** (`12f6d73`).
+2. **Evasive steering in the shield (option 5) — DONE and committed** (`6434233`).
+3. **Training on real KITTI geometry (option 7) — DONE and committed** (`4f753aa`; README voice
+   fix `05dd89e`).
+4. **Cross-drive validation on a second drive (0093) — DONE, uncommitted at time of writing.**
+   Working tree has changes to `fetch_kitti.py`, `eval_kitti_trained.py`, plus doc updates
+   (README / RESULTS / this file). See the session note directly below. Committing is the first
+   action for whoever picks this up. (Drive 0093 data is gitignored; re-fetch with
+   `python3 scripts/fetch_kitti.py --drive 0093 --tracklets`.)
+
+Latest committed commits, newest first:
+
+```
+05dd89e docs: write the gsplat-rt references in first person, as my own prior project
+4f753aa feat: train a policy on real KITTI geometry — recover half the transfer gap
+6434233 feat: opt-in evasive steering — swerve out of an ICS instead of braking into it
+12f6d73 feat: closed-loop dynamic env — static vs dynamic shield on moving traffic
+```
+
+Everything below the `▶` block is the deep record (session write-ups, then decisions, bugs,
+gaps, env facts). Read this block, then dip into those as needed — they are accurate and current.
+
+## ✅ DONE this session: cross-drive validation on a second drive (0093)
+
+To turn the pile of "one drive" caveats into a generalisation claim, I fetched a **second drive,
+0093** (busier/faster: 433 frames, 595 m, **65 moving actors** vs 0009's 12, 20% occupancy vs 8%)
+and re-ran the evals on it — nothing was ever tuned or trained on it. Three findings, one a
+limitation the test existed to catch:
+
+1. **The shield's 0-collision guarantee holds cross-drive.** Single-scan, all 433 frames, 200
+   episodes: gap-following / synthetic / 0009-trained all get **0 collisions shielded** (raw:
+   122 / 73 / 78). The certificate transfers where a policy need not.
+2. **The dynamic shield reproduces.** On 0093's crossing traffic the static shield drives into 14
+   crossing cars, the dynamic shield 4 (collisions 18→13) — same pattern as 0009.
+3. **Training did NOT generalise cross-drive (honest tempering).** The 0009-trained policy scores
+   **59% on 0093, level with synthetic transfer's 58%** — the +7-pt within-drive gain was partly
+   0009-specific structure, not a portable skill. Exactly the "one drive" risk, now measured.
+
+**The limitation it caught — fusion is not spawn-safe on every drive.** The *fused*-map eval could
+not run honestly on 0093: the ego spawns already in collision (27–28/30 frames; single-scan 0/30).
+Fusing 0093's wide, mover-dense 5-scan window deposits **elevated** geometry (z median 1.12 m — not
+ground-removal) from adjacent viewpoints into the ego's own spawn footprint (143 occ cells within
+2 m of ego vs 0 single-scan). Carving does not retire it (its height gate spares elevated returns
+by design), and a post-fusion ego-box clear does not either (the smear surrounds the ego, is not
+its body). So `eval_kitti_trained.py` grew a `--fused-window 1` (single-scan) path, and the
+cross-drive table is single-scan. **Fix for later:** a dynamic channel that forgets movers, or a
+spawn-clearance guard in the scene sampler. **Also fixed this session:** 0093's tracklet zip is
+*flat* (just `tracklet_labels.xml`), so `fetch_kitti.py` extracted labels to the data root — now
+it relocates them into the drive dir.
+
+Reproduce: `python3 scripts/fetch_kitti.py --drive 0093 --tracklets`, then
+`python3 scripts/eval_kitti_trained.py --drive 0093 --all-frames --fused-window 1 --episodes 200 --model synthetic=models/ppo_shielded.zip --model kitti-0009=models/ppo_kitti_shielded.zip`
+and `python3 scripts/eval_dynamic_policies.py --drive 0093 --episodes 200`.
+
+## ✅ DONE this session: training on real KITTI geometry (option 7)
+
+Every policy here was trained on synthetic fields and *transferred* to KITTI (−12–14 pts). Now a
+policy trains on the drive's own recorded occupancy, and **recovers about half that gap on
+held-out road**. Built: `nav_env.kitti_frame_split` (deterministic **contiguous** train/test
+split — the last 30% of the drive is held out and scored, so training never sees the test road; a
+contiguous split is essential because adjacent frames are near-duplicate views); `train_ppo.py
+--scenes {kitti,kitti-fused}` (trains on the fused train-half, cache-friendly `--train-stride`);
+and `scripts/eval_kitti_trained.py` (scores any set of named models on the held-out half, raw and
++shield).
+
+**Result (held-out fused frames, 200 episodes, shield column all 0 collisions):**
+synthetic-transfer shielded **71%** → KITTI-fused-trained shielded **78% (+7 pts)**; unshielded
+collisions 52 → 40. The shield holds **0 collisions in every column** whatever the policy learned.
+Full table in `scripts/RESULTS.md` ("Training on real KITTI geometry"). Honest caveats: one drive
+(within-drive generalisation to a later stretch, not cross-drive), and training *through* the
+shield again beats bolting-on by only +1 (78 vs 77) — consistent with the seed-swept negative
+result, the big in-loop win from `gsplat-rt` still does not reproduce.
+
+Reproduce (models gitignored; ~3 min raw + ~10 min shielded on CPU):
+```bash
+python3 scripts/train_ppo.py --scenes kitti-fused --steps 600000 --out models/ppo_kitti_raw
+python3 scripts/train_ppo.py --scenes kitti-fused --shield --steps 600000 --out models/ppo_kitti_shielded
+python3 scripts/eval_kitti_trained.py --episodes 200 \
+  --model synthetic=models/ppo_shielded.zip --model kitti=models/ppo_kitti_shielded.zip
+```
+
+## ✅ DONE this session: evasive steering in the shield (option 5)
+
+The shield could only brake or hold; now it can **swerve out of an inevitable collision**. Added
+`vehicle.n_evasive_steers` (default **0** = off, so every prior number reproduces) and a third
+search pass in **both** `vehicle.safety_shield` and `dynamics.dynamic_safety_shield`: when neither
+the commanded nor the held steer certifies a stop (what would otherwise be an ICS), search a fan
+of steer angles (`vehicle.evasive_steer_candidates`, ordered by proximity to the commanded angle)
+for one whose braking rollout *is* clear, and take it. **Sound** — each candidate is admitted via
+the same `can_stop_safely` certificate under the very angle it commands, so the successor still
+carries a held-steer braking trajectory and the induction is untouched; it can only turn a
+collision into a safe stop.
+
+- **Open road: works cleanly.** 13 m/s at a lone car 16 m ahead (inside the ~18.8 m stopping
+  distance → ICS for braking) — braking-only drives in, evasive swerves clear. Pinned by
+  `test_evasive_steering_avoids_a_collision_the_braking_shield_drives_into` (+ the dynamic twin).
+- **Real 0009 traffic: marginal, and honestly so.** Dynamic-shield collisions 46 → 45 over 200
+  episodes. Two real reasons: residual collisions are dominated by "run into" (a mover striking an
+  already-*stopped* ego — no forward escape to steer into), and real streets are laterally
+  cluttered so the space a swerve needs is usually occupied. Full write-up in `scripts/RESULTS.md`
+  ("Evasive steering — … where it does and doesn't help"). Reproduce:
+  `python3 scripts/eval_dynamic_policies.py --episodes 200 --evasive 15` (slow — the evasive
+  search adds ~13 steer × 11 accel braking rollouts per ICS decision).
+
+**Do not re-litigate:** the marginal real-traffic result is the honest finding, not a bug to fix.
+The rate limiter in `step_state` (0.06 rad/step) means a large evasive angle is a *command*
+realised as a sustained brake-turn, and `can_stop_safely` certifies the (conservative) constant
+single-step-angle curve — sound but gentle, which is part of why cluttered streets rarely admit a
+swerve. Off by default was chosen for reproducibility, matching every other additive feature here.
+
+## ✅ DONE this session: the closed-loop dynamic env (option 3a)
+
+The dynamic shield was measured open-loop; it now has its **end-to-end moving-world table**, the
+analogue of the static shield's "0 collisions". What was built:
+
+- **`nav_env.DynamicScene`** — static background (movers lifted out) + `MovingObstacle` list +
+  start + goal.
+- **`nav_env.DynamicNavEnv`** (subclasses `DriveNavEnv`) — each `step` advances every mover to
+  `box_at(step*dt)` and rebuilds the obstacle grid; the collision check, rays, and *static* shield
+  read `static ∪ movers-now`, the *dynamic* shield reads `static_grid + movers-now` directly.
+  `cfg.dynamic_shield` (on `DynamicNavConfig`) picks which. A small `grid` property was added to
+  `DriveNavEnv` so the shared observation/info code reads the per-step grid. `info["hit_mover"]`
+  attributes a collision to the moving car specifically.
+- **`nav_env.KittiDynamicScenes`** — mines 0009 for the **91 crossing encounters** (a moving
+  tracklet ahead of the ego, crossing *toward* its line at ≥1 m/s lateral), lifts the actor out,
+  re-inserts it as a constant-velocity box seeded from `KittiDrive.actor_velocity` (promoted here
+  from `eval_dynamic_shield.py`'s `_actor_velocity`).
+- **`scripts/eval_dynamic_policies.py`** and **4 new tests** in `test_nav_env.py`.
+
+**The result (200 episodes, gap-following):** the **static shield drives into a crossing car 51×,
+the dynamic shield 4×**. The dynamic shield's residual 30 mover-collisions are the mover striking
+an ego that had already braked to a stop (unavoidable by braking); **all 34 of its collisions are
+`ics`-flagged** — it never silently drives into a car it could have stopped for. The 4 residual
+"drove in" are ICS-while-moving (a car cutting inside the stopping envelope faster than any brake
+escapes — the documented scope). Full table in `scripts/RESULTS.md` ("Closed-loop dynamic
+traffic").
+
+Key implementation decisions (do not re-litigate):
+- **Composite obstacle set via a rebuilt grid, not `BoxField`.** The build plan suggested
+  `BoxField(static ∪ movers)`, but static geometry is a grid, not boxes — so each step rasterises
+  the movers into the static occupancy and builds a `BEVGrid` (one distance transform/step, cached;
+  fine for an eval). The dynamic shield still takes the static grid + movers list directly, since
+  its `moving_clearance` wants the velocity.
+- **Collision timing mirrors the unit test:** step the ego, advance the world one `dt`, then check
+  the new state against movers at the new time — matching the shield's one-step-ahead certificate.
+- **`certifiable_start` against the frozen t=0 world** (background + mover in place), so no episode
+  starts already unable to stop; both shields then start from the same clamped speed (fair).
+- **Static-shield mover-collisions edge *up* vs unshielded (46→51)** — not a bug: the shield
+  prevents the static-geometry crashes that were ending those episodes early, so more survive to
+  the crossing, where (being static-only) it drives in. The headline is the *drove-in* split.
+
+## The next step (pick one)
+
+3a is closed, so the dynamic-obstacle line is essentially complete. Candidates, roughly ordered:
+
+1. **Resolve the branch / `main`** (see "⚠ Read first"). This is the oldest open thread and should
+   probably go first — fast-forward or open the repo's first PR before piling on more.
+2. **Tune `KittiDynamicScenes` / the encounter filter** — the 91 encounters use fixed thresholds
+   (`min_lateral_speed=1.0`, `ahead_margin=5`, `edge_margin=5`); a sweep might sharpen the table,
+   and PPO-through-shield on the dynamic scenes is untried (`--ppo models/…`).
+3. **Evasive steering in the shield** (option 5) — search over steer candidates, not just
+   commanded-vs-held; the shield currently only brakes, so it can't dodge a crossing car it might
+   have steered around. This is the most *new* headline available now.
+4. Better label-free perception (3b) to close the stage-1 ~95%-FP wall; or more drives/seeds (7).
+
+### Fast reproduce of the current state
+
+```bash
+python3 -m pytest tests/ -q                              # 190 green
+python3 scripts/fetch_kitti.py --tracklets               # tiny; labels for 0009 (drive already on disk)
+python3 scripts/eval_dynamic_policies.py --episodes 200  # NEW: closed-loop static vs dynamic shield
+python3 scripts/eval_dynamic_shield.py                   # open-loop static vs dynamic permitted speed
+```
+
+---
+
+## Latest session (2026-08-04, second sitting): the honest map is drivable now
+
+Option 1 from the previous handoff — "softer unknown semantics, so the honest map is
+drivable" — is **done, and it works**. Hard `unknown_blocks` was sound but unnavigable (4%
+success); the new **cautious speed cap** lifts that to **34–40%** while the shield stays at **0
+collisions on every shielded row**. On `feat/map-fusion`, pushed, **186 tests green**.
+
+What was built, and the two decisions inside it:
+
+- **A separate speed governor, not a change to the shield** (this was the explicit design
+  fork, and separation was chosen). The collision certificate is untouched — it still runs
+  against occupancy alone. Unknown space is *traversable* but the env caps speed to
+  `sqrt(2·max_decel·d)` where `d` is the forward distance to the confidently-free frontier, so
+  the car never enters unmapped space faster than it could brake to a halt at its threshold
+  (`nav_env.cautious_speed_cap`, `bev.BEVGrid.confident_clear_distance`). Because the governor
+  only ever *lowers* accel, a shield-certified state stays certified.
+- **A frontier-only reading was rejected by analysis, not built.** For the shield/rays,
+  `blocking = occupied ∪ unknown` and `occupied ∪ frontier-unknown` give the *same* distance
+  field for any query point in free space (the nearest unknown to a free cell is always a
+  frontier cell). So frontier-only ≈ hard-block ≈ 4%. Don't build it; the no-op is proven.
+- **Unknown hole-closing was the missing piece** (`MapConfig.close_unknown`, an OpenCV
+  morphological close). The raw cap stalled at the ~10 m observation horizon: a single drive's
+  observed road is speckled with `unknown` between lidar rings, so the confidently-free
+  corridor only reaches a **median 10 m** — short of the 20–35 m goals. Closing unknown cells
+  *enclosed* by observed road (not genuine occlusion, which stays open and unclosed) doubles
+  the corridor to a **median 21 m**, into goal range, without touching any occupied cell. This
+  is what turns 4% into ~37%. Scoped to the cap column only, so every other column reproduces.
+
+**The honest read of the remaining gap:** the cap reaches ~37%, not the 60–70% of
+unknown-as-free. That gap is *not* a defect — it is the genuine cost of respecting unobserved
+space (slowing/stopping at real occlusion frontiers) instead of assuming it drivable. It is now
+measured rather than assumed. `outside_is_free`/unknown-as-free stays the optimistic default;
+the cap is the drivable *honest* one. Full numbers below and in `scripts/RESULTS.md`.
+
+Reproduce: `python3 scripts/eval_policies.py --episodes 200 --carve --fused-window 5` (the
+`carved+cap` column). ~15 min on the Mac.
+
+## Also this sitting: object tracklets, and carving credited (0009 is NOT too static)
+
+I added KITTI **object tracklets** and used them to credit free-space carving — the win the
+label-free `eval_mapping` metric structurally could not show. Two things fell out, one of which
+**corrects a claim in the older notes below**:
+
+- **Drive 0009 is not "too static".** It ships 98 labelled objects and **12 of them genuinely
+  move in world coordinates** (a truck 45 m, several cars 20–42 m, three pedestrians), in frames
+  ~35–120 and ~330–425. The previous handoff's "too static to show carving" was wrong — it was
+  *unmeasured*. This also means a new traffic drive is **not** needed to study dynamic actors;
+  0009 has them. (The tracklet file is tiny and downloads without re-fetching the 1.7 GB drive:
+  `fetch_kitti.py --tracklets`.)
+- **Carving's de-smear, finally credited — and its honest ceiling.** `eval_carving_credit.py`
+  paints each moving actor's labelled footprint over a window, takes the *trail* (where it was
+  minus where it is), and measures the fraction carving retires vs how much of the actor's
+  *current* footprint it wrongly erases. At the safe operating point (window 5, persistence 2)
+  carving retires **9%** of trail while keeping **96%** of the present actor; pushing it (window
+  10–15, persistence 1) lifts trail credit to 24–26% **but** drops actor-kept to 66–73% — it
+  starts erasing the real, present obstacle, the one error that can crash. **The finding: the
+  same height gate that makes carving safe (won't erase an obstacle a beam flew over) is what
+  caps its forgetting** — a vacated cell is only retired if a later beam grazed the ground there.
+  Safety and de-smear are one mechanism. Full table in `scripts/RESULTS.md`.
+
+Infra added, reusable for dynamic obstacles next: `kitti.Tracklet` + `KittiDrive.tracklets` /
+`tracklet_boxes(frame)` / `moving_tracklets()` (velo frame, world-displacement classifier), and
+`bev.rasterize_box` / `rasterize_polygon` / `box_corners`. Tracklet poses are **native to the
+velo frame**, so a box drops straight into the BEV with no transform — which is exactly what a
+dynamic-obstacle shield scenario will want.
+
+Reproduce: `python3 scripts/eval_carving_credit.py --window 5 --persistence 2`.
+
+## And this sitting: dynamic obstacles — the shield now reasons about motion
+
+Option 3 (dynamic obstacles) is built in two stages. **Stage 1 (label-free velocity) hit a
+perception wall; stage 2 (the dynamic shield) is done and works, fed by tracklet motion** — the
+direction the user chose after seeing stage 1's false-positive rate.
+
+**Stage 1 — label-free velocity from occupancy (`dynamics.estimate_obstacle_velocities`).**
+Tracks occupancy connected-components across a short ego-compensated window, keeping only
+**temporally coherent** motion (net/path displacement ratio). Graded against tracklets
+(`eval_dynamics.py`): **~35% detection at ~95% false positive, at every operating point.**
+Velocity is accurate *when* it matches (~0.55 m/s, ~6°), but the FPs are **aspect-change
+parallax**, not jitter — driving past a parked car (0009 has 89), the lidar sees a new face each
+frame, so its centroid drifts coherently and reads as motion. Occupancy-centroid velocity cannot
+separate that from a slow vehicle without shape. **Conclusion: too FP-heavy to drive the shield**
+(~10 phantom movers/frame ⇒ brakes for parked cars everywhere). Kept as the measured perception
+gap; the estimator is still sound infra.
+
+**Stage 2 — the dynamic shield (`dynamics.dynamic_safety_shield`), fed tracklet motion.** It is
+`vehicle.safety_shield` with the clearance checks **time-indexed**: through the braking rollout
+the obstacles advance along their velocity (`box_at(t)`), so it certifies "can I stop clear of
+where they *will be*." Same inductive structure + held-steer fallback; sound *to the extent the
+constant-velocity prediction holds* (an obstacle predicted to cut in trips `ics`). Two results:
+- **Synthetic crossing test:** a car sweeping across the lane — the **static shield drives into
+  it**, the **dynamic shield stops clear** (`test_static_shield_hits_a_crossing_car…`). The
+  moving-obstacle analogue of braking-vs-one-step.
+- **Real 0009 (static vs dynamic permitted speed at the ego, 421 mover-frames):** dynamic is
+  **more conservative on 8%** (worst **−8.3 m/s**), unchanged on 92% (mover not in the path),
+  never wrongly more permissive. That 8% is exactly the frames where treating a moving world as
+  frozen is a safety error.
+
+New API in `dynamics.py`: `MovingObstacle` (+ `box_at`), `point_box_distance`, `BoxField`,
+`moving_clearance`, `can_stop_safely_dynamic`, `dynamic_safety_shield`, `max_safe_speed_dynamic`.
+The shield core is pure-NumPy and composes `vehicle.py` primitives (no change to the certified
+static core). **Not yet done:** a closed-loop dynamic *env* (obstacles stepping while a policy
+drives) for an end-to-end success/collision table — the pieces are all here, it just needs a
+`DynamicScene` that advances movers each `step`. That is the natural next build.
+
+Reproduce: `python3 scripts/eval_dynamics.py` and `python3 scripts/eval_dynamic_shield.py`.
+
+## ⚠ Read first: the tree is not where you'd assume
+
+**All the mapping/carving work is on `feat/map-fusion`, pushed, and NOT merged to `main`.**
+
+```
+feat/map-fusion  a289ebe  feat: honest unknown-blocks semantics + carved-map planner measurement
+                 8515611  feat: height-aware free-space carving + occupied/free/unknown map
+                 e01bb73  docs: bring the handoff current
+                 9083033  feat: let the planner drive the accumulated map
+                 db410e3  feat: fuse VO poses + lidar into an accumulated BEV map
+main             02a1098  ← still the previous session's tip, five commits behind
+```
+
+Working tree clean, branch in sync with `origin/feat/map-fusion`. **A decision is still
+pending and was left to the user:** fast-forward `main` (`git checkout main && git merge
+--ff-only feat/map-fusion && git push`) or open the repo's first PR. Nothing is blocked on it —
+just don't assume `main` has any of the fusion/carving work, and don't re-do it because
+`git log main` looks stale.
+
+This also breaks the repo's prior convention of committing straight to `main`; the branch was
+used because the change is large. Either resolution is fine, but pick one before adding more.
+
+Separately: **`~/Documents/gsplat-rt` has an uncommitted `HANDOFF.md`** — pre-existing, from
+before this repo started, recording the "Option B chosen" decision. Not this repo's problem,
+but it will show up in `git status` there and is not a stray edit to discard.
+
+## What this is
+
+AV navigation on real recorded drives. Replay a KITTI sequence, build the occupancy/BEV
+representation a real AV stack plans on, and drive a vehicle through it behind a **braking-
+aware safety shield** that provably cannot admit a collision it could have braked out of.
+
+Public: <https://github.com/matthewhamilton3141/kitti-nav>. Runs entirely on the Mac — pure
+NumPy/OpenCV core, CPU-only RL. **No Brev box needed for anything here**, which was a
+deliberate constraint (A10G credits were out as of 2026-08-01 and remain unconfirmed).
+
+## Where it came from
+
+The "Option B" branch out of `gsplat-rt`'s 2026-08-01 handoff, after the pivot to *"I don't
+want a portfolio piece, I just want to make something cool."* `gsplat-rt` itself is complete
+and untouched (its own Option A — browser splat scan + WebGL physics — was **not rejected,
+just not picked first**; details in that repo's HANDOFF.md, which still has uncommitted
+edits from before this work started).
+
+The seed idea was `gsplat-rt`'s nav capstone: a hard safety shield wrapping any policy. The
+question was whether it survives contact with *driving*. Mostly it did — but almost nothing
+ported unchanged, and one of its headline results did not reproduce (below).
+
+## Status — **190 tests green** (on `feat/map-fusion`; `main` is at 105)
+
+| milestone | state | measured |
+| --- | --- | --- |
+| Bicycle (Ackermann) model + braking shield | done | — |
+| KITTI raw loading (stereo + lidar + OXTS) | done | drive 0009: 447 frames, 332.8 m, ≤11.4 m/s |
+| Stereo VO (ORB + PnP) | done | **3.55% drift** over 332.8 m, 26.4 fps CPU |
+| Lidar → BEV occupancy + distance field | done | **4.3% occupied, 2.1 ms/frame** |
+| Shield on real lidar | done | **6 ms/frame**; binds on 3/443 frames |
+| Learned planner (PPO) behind the shield | done | **78% success, 0 collisions** on real KITTI |
+| Shield-in-the-loop, 5-seed replication | done | **negative result** (see below) |
+| **VO poses + lidar fused into an accumulated map** | done — *on the branch* | **1.86× the scene mapped at 5 scans** |
+| **Planner driving the fused map** | done — *on the branch* | **shield still 0 collisions; success −12 to −14 pts** |
+| **Free-space carving + occupied/free/unknown map** | done — *on the branch* | **map-metric non-result, but carving wins +4 pts on the planner; shield 0 collisions on every map (below)** |
+| **Cautious speed cap + unknown hole-closing** | done — *on the branch* | **honest map drivable: hard-block 4% → cap 34–40% success; shield still 0 collisions; corridor 10→21 m** |
+| **Object tracklets + carving credited by labels** | done — *on the branch* | **0009 has 12 real movers (not "too static"); carving retires 9% of trail keeping 96% of the present actor** |
+| **Dynamic shield: braking for an obstacle's predicted path** | done — *on the branch* | **static shield crashes a crossing car the dynamic one stops clear of; binds on 8% of real mover-frames (worst −8.3 m/s)** |
+| **Closed-loop dynamic env: movers step while a policy drives** | done — *on the branch* | **on 0009's 91 crossing encounters the static shield drives in 51×, the dynamic shield 4×; residual hits are movers striking a stopped ego, all ics-flagged** |
+| **Evasive steering: swerve out of an ICS instead of braking into it** | done, opt-in — *on the branch* | **open-road: cleanly avoids an obstacle it can't brake for; real traffic: marginal (dyn-shield coll 46→45), room to swerve usually absent** |
+| **Training a policy on real KITTI geometry (vs synthetic transfer)** | done — *on the branch* | **held-out shielded success 71%→78% (+7 pts), raw collisions 52→40; shield 0 collisions in every column** |
+| **Cross-drive validation on a second drive (0093)** | done — *on the branch, uncommitted* | **shield 0 collisions on a drive nothing was tuned on; dynamic shield reproduces; training doesn't generalise (59%≈58%); caught a fusion spawn-safety limitation** |
+
+Full numbers: `README.md` and `scripts/RESULTS.md`.
+
+## This session: free-space carving — built, sound, and an honest non-result
+
+Option 1 from the previous handoff is done. Carving (`mapping.fuse_map` with `carve=True`, or
+`ScanAccumulator` streaming) ray-casts each scan and retires an occupied cell a later scan saw
+*through*; `BEVGrid` now carries an occupied / free /
+**unknown** tri-state (`mapping.FusedMap`) instead of only `outside_is_free`. `carve` is off by
+default and the un-carved path reproduces the old occupancy bit-for-bit (there is a test).
+
+**Read this before spending more time on carving — the real-data result is a non-result, on
+purpose, and re-deriving it wastes a day.**
+
+- **It is height-aware (2.5D), and that is the whole point.** A beam clears a cell only where
+  it crossed the near-ground band `[ground, ground+0.25]`, so a beam flying *over* a car to a
+  wall behind it cannot erase the car. The one failure class that can crash (a lost real
+  obstacle) is what the height gate exists to prevent. `test_carving_spares_an_obstacle_a_beam_passes_over`
+  is the test the design exists to pass; a flat 2D carve fails it.
+- **The evidence rule is `misses > carve_persistence * hits`** (log-odds-ish, occupied-biased),
+  counted once per scan. A static wall (hit every scan) is never retired in a short window; a
+  moving actor (hit once, driven past) is. Default `carve_persistence = 2`.
+- **On drive 0009 it does NOT improve the map-vs-GT metric — at any persistence.** Missed and
+  phantom tick *up* slightly at every window (w5: missed 10.10→10.52%). Two structural reasons,
+  both real: (1) the eval carves *both* the GT and VO maps (a GT map smears actors into trails
+  too, so carving only VO would score de-smeared cells as dangerous "missed"), so the benefit
+  is symmetric and **cancels** in a VO-vs-GT comparison; (2) the drive is largely static, so
+  there is little dynamic smear to forget. Occupancy agreement cannot separate a correctly
+  forgotten actor from lost geometry without per-actor labels — so it cannot credit carving.
+- **What carving *does* do is remove cells, growing with the window** (−0.2% at 2 scans to −11%
+  at 20), and **at large windows it is a liability**: by 20 scans the worst optimistic excursion
+  jumps +7.38 → **+21.00 m/s** (a real obstacle blurred by 84 cm of drift, carved away, read as
+  clearance near the grid edge). At the operating point (5 scans) it is safe and nearly inert
+  (unsafe direction unchanged, 3/36 @ +0.57). Keep carving to short windows.
+- **The dead end, so it is not retried:** tuning `carve_persistence` (swept 2/4/8) does not find
+  a value that both de-smears and keeps missed flat — higher just makes carving more inert. The
+  payoff is not demonstrable through `eval_mapping` on a static drive. Where it *does* show is
+  the planner — see the next section.
+
+## This session too: honest "unknown blocks" semantics + the carved-map planner measurement
+
+The deferred half of the carving plan is done. `BEVGrid.unknown_blocks` folds the `unknown`
+mask into the shield's `distance_field` and the policy's `ray_distances` (via a `blocking`
+property = `occupancy` or `occupancy | unknown`); `KittiScenes(unknown_blocks=…)` builds carved
+tri-state scenes with `fuse_map`; `eval_policies.py --carve` adds two columns. All off by
+default — the un-carved policy numbers reproduce.
+
+`eval_policies.py --episodes 200 --carve --fused-window 5` gives three KITTI columns per policy
+(fused / carved / carved+unknown-blocks). **Three findings, and do not re-derive them:**
+
+1. **The shield holds 0 collisions in every column**, including carved+unknown where the map is
+   majority-obstacle and the car barely moves. Strongest form of the headline: the certificate
+   is re-derived from whatever occupancy it is handed, so more obstacle only makes it more
+   conservative, never unsound.
+2. **Carving wins ~4 of the ~12 points fusion cost back** (PPO raw 66% fused → 70% carved, coll
+   67 → 60); every other row moves the same small, safe direction. It does *not* recover the
+   whole drop, and should not — most of that drop is real geometry a single scan missed, which
+   carving keeps. First positive signal for carving anywhere; the map metric could only show cost.
+3. **Hard unknown-blocking is unnavigable (4% success everywhere).** A single-drive accumulated
+   map is >50% unknown, so treating every unobserved cell as blocked leaves no path to a 20–35 m
+   goal. It took two correctness fixes just to get off 0% — crediting any cell with a *return* as
+   observed (not just obstacle-band hits), and exempting the roof lidar's ~4 m near-field ground
+   blind spot (`carve_near_field`, the ego is on road it cannot see under) — and the through-path
+   is still walled. The honest reading is **sound but too strict to drive**: it wants a
+   frontier-only / free-for-traversal softening. This is *why* unknown-as-free is the pragmatic
+   default, now measured rather than assumed.
+
+Reproduce: `python3 scripts/eval_policies.py --episodes 200 --carve --fused-window 5`.
+
+Reproduce: `python3 scripts/eval_mapping.py --sweep 1 2 3 5 10 20 --every 12 --max-speed 21 --carve`.
+
+## Last session: the VO↔BEV gap is closed (branch `feat/map-fusion`)
+
+The "biggest architectural hole" the previous handoff named is fixed. `src/kitti_nav/mapping.py`
+transforms scans through estimated poses into the current Velodyne frame and rasterises them
+together; `scripts/eval_mapping.py` measures single-scan vs GT-pose vs VO-pose maps.
+
+**Three findings worth not re-deriving:**
+
+1. **Global ATE is the wrong statistic for map fusion.** VO ends 12.06 m off (3.55%), which
+   sounds fatal, but a fused map never composes poses beyond its own window. The governing
+   number is the *relative* pose error over that window — 24 cm at 5 scans. Two orders of
+   magnitude apart, and it is why VO-pose maps match GT-pose maps almost exactly up to 5 scans
+   (permitted speed 13.37 vs 13.36 m/s).
+2. **The single-scan map was optimistic because it was blind.** It permits 16.38 m/s where the
+   5-scan map permits 13.36, while missing **44%** of that map's occupied cells. Fusion makes
+   the planner slower and better informed — do not read the speed drop as a regression.
+3. **Operating point is 5 scans.** Between 5 and 10 the unsafe direction (VO map permitting
+   more than the GT map) jumps 3/36 → 9/36 frames, worst excursion +0.57 → +4.39 m/s.
+
+**The bug it surfaced — read this before touching `bev.py`.** Accumulation first cut permitted
+speed 25.1 → **2.2 m/s**, with phantom obstacles inside the car's own footprint, *with perfect
+poses*. The roof-mounted Velodyne sees the ego car (hood, roof rails, mirrors). In a single scan
+those cells hold *only* bodywork, so the per-cell ground estimate treats the bodywork as ground
+and calls the cell free — **the single-scan map was right by accident**. Fusion supplies the road
+surface underneath from an earlier viewpoint, and the 0.81 m difference reads as an obstacle.
+Fixed by ego self-filtering (`drop_ego_returns`, box `KITTI_EGO_BOX` measured not derived, since
+the body rectangle is anchored 0.32 m off the lidar centreline while self-returns are symmetric
+about the sensor and reach 1.5 m laterally). Costs 41 returns and **zero** occupancy cells on a
+single scan, so it is on by default everywhere.
+
+Two dead ends, recorded so they are not retried: `min_support` (requiring several returns above
+ground per cell) looked like the fix but could not separate phantom from real — restoring
+single-scan parity needed a threshold that pushed occupancy *below* the single-scan baseline,
+i.e. deleting real geometry. And detecting ego returns by sensor-frame persistence needs a
+lateral bound: roadside structure persists too while the car holds its lane, and without it the
+audit returns a kerb line at y ≈ −2.3 m present in 100% of scans.
+
+**The planner now drives the fused map** (`KittiScenes(map_config=MapConfig(window=5))`,
+`eval_policies.py --fused-window`). Default is still a single scan, so every earlier number
+stays reproducible — and the single-scan column re-ran **bit-identically** (66%/68, 78%/42,
+78%/0), which is the check that the ego self-filter really is a no-op on the un-fused path.
+
+| policy | single scan | fused (5 scans) |
+| --- | --- | --- |
+| gap-following | 66% / 68 coll | 59% / 82 |
+| gap-following + shield | 66% / **0** | 54% / **0** |
+| PPO (raw) | 78% / 42 | 66% / 67 |
+| PPO (raw) + shield at eval | 75% / **0** | 62% / **0** |
+| PPO through shield | 78% / **0** | 64% / **0** |
+
+**The headline is the shield column.** Same policy weights, no retraining, no notice that the
+map changed — unshielded collisions rise (42→67) and success falls 12–14 points, while every
+shielded row stays at **exactly 0**. The shield is not a policy; it re-derives a braking
+certificate from whatever occupancy it is handed, so more obstacles make it more conservative,
+never less sound. This is the strongest evidence in the repo that the guarantee is a property
+of the method rather than of the scenes it was tuned against.
+**Do not read the success drop as a regression** — the single-scan map was missing 44% of the
+fused map's occupied cells, so the old numbers were partly measuring the map's blindness.
+Both tables are kept: the single-scan one is what the 5-seed negative result was measured
+against. On fused maps in-loop training leads +2 pts (64 vs 62), same small same-signed gap
+as single-scan (+3) — corroboration, not evidence; the seed sweep has **not** been re-run on
+fused maps (~35 min if wanted).
+
+**Also corrected on that branch:** the README's ground-removal table did not reproduce
+(claimed 1.82%/6.23% occupancy and `height_diff` as the *faster* mode; actually 2.40%/3.65% at
+frame 0 and `height_diff` is slower, 2.1 vs 1.3 ms). Corrected in place with a note. The paired
+clearance figures did reproduce. Conclusion and default are unchanged.
+
+## Decisions already made — don't re-litigate these
+
+- **Occupancy/BEV is the live representation, not splats.** Real stacks plan on occupancy;
+  splatting's AV role is offline digital twins for closed-loop testing.
+- **The shield verifies a full braking rollout, not one step.** A one-step lookahead is
+  *unsound* at driving speed (12 m/s needs ~16 m to stop; one 0.1 s step covers 1.2 m).
+  `test_one_step_shield_crashes_where_braking_shield_stops` demonstrates the naive port
+  driving into a wall.
+- **No Sim(3) alignment in VO evaluation.** Correct for monocular, self-flattery for stereo —
+  it would absorb real scale error. A test pins this.
+- **Grid-native `ObstacleField`, never fitting circles to occupancy.** Circles would discard
+  exactly the arbitrary shape occupancy is good at.
+- **`height_diff` (local per-cell) ground removal**, chosen by measurement over a fixed plane:
+  2.40% vs 3.65% occupied at frame 0 (4.33% vs 8.23% drive mean), 5.96 m vs 2.58 m clearance
+  at 30 m, and 2.1 vs 1.3 ms — it is the *slower* mode, and the extra 0.8 ms is worth it. The
+  plane mode's extra cells are *road* drifting out of the band — phantom obstacles that brake
+  the car for open road. (Figures re-measured 2026-08-02; the previous 1.82%/6.23%/"faster"
+  did not reproduce. Conclusion and default unchanged.)
+- **Point-level, not grid-level, scan fusion.** Transform point clouds and rasterise once,
+  rather than rasterising each scan and OR-ing the grids. The ground estimate *improves* with
+  more returns per cell, which is exactly `height_diff`'s weak spot; OR-ing binary grids would
+  bake each scan's ground-removal mistakes in permanently.
+- **Ego self-filtering is on by default everywhere**, including the single-scan path, where it
+  costs zero occupancy cells. See bug 6.
+- **Ray observations, not an occupancy crop** — `gsplat-rt` measured the crop as marginal.
+- **CPU for RL.** Batches are far too small to amortise GPU launches; 6191 fps unshielded.
+- **Trained policies are gitignored** — reproducible in minutes.
+
+## Bugs found — all instructive, all fixed
+
+1. **Shield passed steering through unconditionally → unsound.** The braking certificate is
+   issued under the *current* wheel angle; a different commanded angle can curve full braking
+   into an obstacle the certificate never covered. Now falls back to the last certified steer.
+   **Found by a randomised rollout test, not by hand.**
+2. **Rear axle ≠ lidar origin.** The Velodyne is roof-mounted **0.81 m ahead** of the rear
+   axle, and the bicycle pose *is* the rear axle. Placing the car at the lidar origin pushed a
+   4.77 m vehicle most of a metre too far forward and corrupted every clearance query. Fixing
+   it (+ 3→5 footprint discs) moved median permitted speed 19.8 → 35.0 m/s and dropped frames
+   where the shield overrides the driver from 15 → 3.
+3. **443 lidar scans for 447 images.** Real datasets have holes; bound lidar loops on
+   `n_velodyne`.
+4. **36% of episode starts were inevitable-collision states** — spawned faster than any
+   braking could save. This surfaced as *shield-on collisions* and was very easy to misread as
+   the shield failing. `certifiable_start()` clamps spawn speed; collisions then go to exactly
+   0. **Lesson: check start certifiability before blaming a shield.**
+5. **A confidence interval that measured the wrong variance.** 600 eval episodes measure
+   *scene* luck; the claim was about a *training method*, whose replicate is the training run.
+   Fixed by the 5-seed sweep.
+6. **The car mapped itself as a wall.** The roof-mounted Velodyne sees its own bodywork. In a
+   single scan those cells hold *only* bodywork, so the per-cell ground estimate takes the
+   bodywork as ground and calls them free — **right by accident**. Fusion supplies the road
+   surface underneath from an earlier viewpoint, the 0.81 m difference reads as an obstacle,
+   and phantom walls appear inside the vehicle footprint: permitted speed 25.1 → **2.2 m/s**,
+   *with perfect poses*. Fixed by `mapping.drop_ego_returns`. **Lesson: a latent bug can be
+   masked by a limitation, and removing the limitation is what exposes it — the single-scan
+   map's blindness was hiding it.** Symmetrically, `min_support` (demand several returns above
+   ground per cell) *looks* like the fix and is not: separating phantom from real needs a
+   threshold that pushes occupancy below the single-scan baseline, i.e. deletes real geometry.
+
+## The negative result (keep it honest)
+
+**Training through the shield did not beat bolting it on at evaluation** — contradicting
+`gsplat-rt`, where shield-in-the-loop strictly dominated (100%/0/56 vs 98%/4/58).
+
+5 seeds × 200 episodes, 0 collisions in all 10 runs:
+
+| scenes | at-eval | in-loop | difference |
+| --- | --- | --- | --- |
+| synthetic | 71.9% ± 1.5% | 72.0% ± 2.9% | +0.1%, CI [−3.5, +3.7], p = 0.95 |
+| KITTI | 76.2% ± 1.0% | 77.3% ± 1.2% | +1.1%, CI [−0.5, +2.7], p = 0.14 |
+
+**The precise claim:** not that in-loop training never helps, but that its *large* win in
+`gsplat-rt` does not reproduce here. The CI caps any real effect at +2.7 points, and 4/5 seeds
+do favour in-loop — so a small genuine benefit is **not** excluded. "Not significant" ≠ "no
+effect." Why: eval-time shielding already costs this policy ~nothing (on synthetic it *helps*,
+since a collision ends the episode as a failure), so there is no penalty left to recover.
+
+Seed spread was small (1.0–2.9 pts), unusually low for deep RL. Sweep cost ~35 min for 10 runs.
+
+## Known gaps — read this before picking next work
+
+- **⚠ Dynamic actors are still the top gap — but now measured, not assumed, and the shield
+  does not yet reason about motion.** Accumulation smears moving actors into trails; carving
+  retires some of that (**credited this sitting**: 9% of trail at the safe operating point, up
+  to 26% at settings that start erasing the present actor — see the tracklet section). The two
+  things genuinely open: (1) carving's de-smear is capped by the safety height-gate, so a
+  *dedicated* dynamic channel (use the tracklet labels, or a two-frame occupancy diff, to mark
+  and forget movers without touching static geometry) could do better than the safe-tuned carve;
+  (2) ~~the shield still treats every obstacle as static~~ **RESOLVED** — the dynamic shield
+  reasons about a moving obstacle's reachable set, and (this session) the closed-loop
+  `DynamicNavEnv` measures it end-to-end. What remains open here is only *perception* (label-free
+  velocity is the ~95%-FP wall) and *evasion* (the shield brakes, never swerves). NB: the old
+  claim that 0009 is "too static" was **wrong** — it has 12 real movers.
+- **The free/unknown distinction is now drivable via the cap (resolved this session), but the
+  cap is one design point, not a swept one.** `unknown_blocks` (hard) is sound but unnavigable
+  (4%); the **cautious speed cap** + **hole-closing** makes it drivable (34–40%) with the shield
+  still at 0 collisions — see the latest-session section. What is *not* done: the cap's knobs are
+  untuned. `cautious_speed_cap` uses a fixed forward cone (`half_cone=0.15`, 3 rays) and
+  `close_unknown=5` cells (1 m) — reasonable, measured once, but not swept. A wider cone is more
+  conservative (sees lateral unknown, caps harder); a bigger close window frees more but risks
+  bridging a thin real occlusion. There may be a few points in tuning these. Also: the cap is
+  only applied in the *env* (`DriveNavEnv.step`), not in `eval_mapping.py`, so the map-permitted-
+  speed sweep still reports the hard/optimistic readings, not the capped one. Separately, the
+  largest optimistic (unsafe-direction) excursions are still obstacles near `x_max = 50 m` that
+  drift pushes across the boundary — carving *worsens* them at large windows (+21 m/s at 20
+  scans), another reason to keep the window short.
+- **The grid cannot certify above 21.2 m/s.** `sqrt(2 · 4.5 · 50)`. Any permitted speed above
+  that is `outside_is_free` talking, not the sensor — which is why `eval_mapping.py` caps at 21
+  while `render_bev.py` still uses 35. Worth reconciling.
+- **Evasive steering exists now but is opt-in and narrow.** `n_evasive_steers > 0` lets the
+  shield swerve out of an ICS (sound; both shields); it works cleanly on an open road but is
+  marginal on real cluttered traffic (46→45 dyn-shield collisions), because the room to swerve is
+  usually occupied and most residual hits are movers striking a *stopped* ego. Off by default. The
+  open question it leaves: a less conservative evasive certificate (a *sustained* brake-turn, not a
+  constant single-step angle) could admit sharper swerves — but that is more theory than wiring.
+- **The footprint disc cover is conservative** — inflates the car ~0.12 m per side and ~0.55 m
+  past each bumper. Real cost: at frame 294 it permits 3.4 m/s where the human drove 10.0,
+  threading parked cars with 0.03 m modelled clearance.
+- **VO has no bundle adjustment, keyframing, or loop closure** — error accumulates
+  monotonically. 3.55% is respectable, not SOTA.
+- **Two drives now, not one — but generalisation is mixed.** Cross-drive (0093) is done: the
+  **shield** transfers cleanly (0 collisions on an unseen drive), but the **trained policy does
+  not** (0009-trained ≈ synthetic on 0093). So "trained on real geometry" is drive-specific, not a
+  portable skill. Still two drives, one calib day, one hyperparameter set.
+- **⚠ NEW — fusion is not spawn-safe on every drive.** On 0093 the fused map spawns the ego in
+  collision (elevated smear into the spawn footprint; single-scan is clean). Carving can't fix it
+  (height gate), nor a post-fusion ego-box clear (not the ego body). The fix is a dynamic mover-
+  forgetting channel or a spawn-clearance guard in the scene sampler — **not done**. Until then the
+  accumulated-map eval needs per-drive checking; `eval_kitti_trained.py --fused-window 1` sidesteps
+  it with single-scan.
+- **The seed sweep has not been re-run on fused maps** (single-scan only), nor on the KITTI-trained
+  policies — the +7-pt training result is one seed each. A seed sweep would firm it up (~13 min/run).
+- **Training on the dynamic scenes (`KittiDynamicScenes`) is still untried.**
+
+## What next — options
+
+**Update: options 1, 2, 3 (incl. 3a), 5 (evasive), 7 (train on real geometry), and cross-drive
+validation are all done.** The branch/`main` divergence is resolved (fast-forward). See the START
+HERE session notes. **My recommendation now: fix fusion spawn-safety, then either a spawn-clearance
+guard or a dynamic mover-forgetting channel.** The cross-drive test exposed that the accumulated
+map paints elevated smear into the ego's spawn footprint on a fast, mover-dense drive — the single
+concrete correctness gap left, and it blocks the fused-map eval on new drives. A **dynamic channel
+that marks-and-forgets movers** (tracklet labels or a two-frame occupancy diff) is the principled
+fix and doubles as the long-standing "dedicated dynamic channel" gap. Secondary: seed-sweep the
+KITTI-trained policies to firm up +7 pts; train on `KittiDynamicScenes`; or a third drive. The one
+*new-theory* shield item left is evasive steering's sustained-brake-turn certificate, still niche.
+
+1. **✅ DONE — softer unknown semantics, so the honest map is drivable.** The **cautious speed
+   cap** plus **hole-closing** takes hard-block's 4% to 34–40% with the shield still at 0
+   collisions. Frontier-only was analysed and rejected (a no-op for the shield). What remains is
+   *tuning* the cap's cone/close-window (see known gaps), not designing it.
+2. **✅ DONE (differently than planned) — carving credited on real traffic.** No new drive: 0009
+   has 12 real movers, and `eval_carving_credit.py` credits carving with the object labels (9%
+   trail retired at the safe point, 96% of the present actor kept). See the tracklet section.
+3. **✅ DONE — dynamic obstacles.** The **dynamic shield** (`dynamics.dynamic_safety_shield`)
+   time-indexes the braking rollout so it brakes for where an obstacle is *going*; it crashes a
+   crossing car the static shield hits, and binds on 8% of real 0009 mover-frames. **Stage 1
+   (label-free velocity) is the measured perception wall** — ~95% false positive from
+   aspect-change parallax, too dirty to drive the shield, so the shield runs on tracklet motion.
+   **3a (closed-loop dynamic env) is now done** — `DynamicNavEnv` + `KittiDynamicScenes` +
+   `eval_dynamic_policies.py`: static shield drives into a crossing car 51× vs the dynamic
+   shield's 4× (200 episodes). See the START HERE session note. *Optional (3b):* better label-free
+   perception (scene-flow with shape, or a learned head) to close the stage-1 gap.
+5. **✅ DONE (opt-in) — evasive steering in the shield.** `n_evasive_steers > 0` searches a fan
+   of steer candidates when braking can't certify a stop, swerving out of an ICS; sound, in both
+   shields. Clean on an open road, marginal on real cluttered traffic (see the START HERE note and
+   `scripts/RESULTS.md`). Open extension: a sustained-brake-turn certificate for sharper swerves.
+6. Strengthen VO: local bundle adjustment or keyframing; SuperPoint+LightGlue front-end beat
+   ORB in `gsplat-rt` (3.5 cm vs 5.7 cm ATE on TUM) but is box-gated. Note the mapping result
+   lowers the priority of this: fusion is governed by *within-window* relative error, which is
+   already 24 cm, not by the global drift bundle adjustment would fix.
+7. More drives / seeds to firm up generalisation claims.
+
+## Environment / repo facts
+
+- Dev Mac runs **everything**: numpy, OpenCV, and the RL stack — **torch 2.13 + sb3 2.9 +
+  gymnasium 1.3, CPU**. No GPU needed anywhere in this repo.
+- Data: `data/kitti_raw/` is **gitignored, never committed** (KITTI is CC BY-NC-SA 3.0,
+  non-commercial). Refetch: `python3 scripts/fetch_kitti.py`. Drive 0009 is ~1.7 GB; the
+  cross-drive second drive **0093** is ~1.6 GB (`--drive 0093 --tracklets`, 433 frames, busy).
+- `models/` is gitignored; retrain via `scripts/train_ppo.py` (1.5 min raw, ~5 min shielded).
+- Tests: `python3 -m pytest tests/ -q`. Dataset-backed tests skip cleanly without KITTI; the
+  env core is pure NumPy and tests with no RL stack installed.
+- Attribution is policy, not decoration: `ATTRIBUTION.md` lists every upstream with license;
+  adapted files carry provenance headers saying what changed and why. **KITTI is
+  non-commercial**; pykitti/sb3/gymnasium are MIT, OpenCV Apache-2.0, torch BSD-3.
+- Workflow: was direct commits to `main` (solo repo, no PRs). The mapping work broke that and
+  sits on `feat/map-fusion` — see the top of this file; resolve before adding more.
+- The VO trajectory is cached at `data/cache/vo_poses_*.npz` (gitignored, ~17 s to rebuild).
+  `eval_mapping.py --refresh-vo` forces a rebuild.
+- Numbers in the docs are re-measured, not inherited. Two claims were corrected downward this
+  way (the ground-removal table, and gsplat-rt's shield-in-the-loop win). If a figure here
+  disagrees with what you measure, **trust your measurement and correct the doc.**
+
+## Commands worth knowing
+
+```bash
+python3 -m pytest tests/ -q                     # 186 green; dataset tests skip without KITTI
+
+# object tracklets: fetch the labels (tiny), then credit carving's de-smear on real movers
+python3 scripts/fetch_kitti.py --tracklets
+python3 scripts/eval_carving_credit.py --window 5 --persistence 2
+
+# dynamic obstacles: label-free velocity accuracy, then the dynamic shield vs the static one
+python3 scripts/eval_dynamics.py --window 4 --coherence 0.8 --min-speed 1.5
+python3 scripts/eval_dynamic_shield.py                   # open-loop: static vs dynamic permitted speed
+python3 scripts/eval_dynamic_policies.py --episodes 200  # closed-loop: static vs dynamic shield on movers
+python3 scripts/eval_dynamic_policies.py --episodes 200 --evasive 15  # + the evasive-steering row (slow)
+
+# mapping: the sweep behind the accumulated-map table, and the ego self-filter audit
+python3 scripts/eval_mapping.py --sweep 1 2 3 5 10 20 --every 12 --max-speed 21
+python3 scripts/eval_mapping.py --audit-ego
+
+# free-space carving: the carved comparison (--carve), plus the carve_persistence sweep
+python3 scripts/eval_mapping.py --sweep 1 2 3 5 10 20 --every 12 --max-speed 21 --carve
+python3 scripts/eval_mapping.py --sweep 5 10 20 --every 12 --carve --carve-persistence 4
+
+# policies: prints synthetic + KITTI single-scan + KITTI fused, all three
+python3 scripts/eval_policies.py --episodes 200
+# ...and --carve adds carved / carved+unknown-blocks / carved+cap columns (the drivable honest map)
+python3 scripts/eval_policies.py --episodes 200 --carve --fused-window 5
+
+# train a policy on real KITTI geometry (train-split), then score on the held-out stretch
+python3 scripts/train_ppo.py --scenes kitti-fused --shield --steps 600000 --out models/ppo_kitti_shielded
+python3 scripts/eval_kitti_trained.py --episodes 200 \
+  --model synthetic=models/ppo_shielded.zip --model kitti=models/ppo_kitti_shielded.zip
+
+# cross-drive: fetch a second drive, then score 0009-trained policies on all of it (single-scan)
+python3 scripts/fetch_kitti.py --drive 0093 --tracklets
+python3 scripts/eval_kitti_trained.py --drive 0093 --all-frames --fused-window 1 --episodes 200 \
+  --model synthetic=models/ppo_shielded.zip --model kitti-0009=models/ppo_kitti_shielded.zip
+python3 scripts/eval_dynamic_policies.py --drive 0093 --episodes 200   # dynamic shield, cross-drive
+
+python3 scripts/eval_odometry.py --plot docs/trajectory.png
+python3 scripts/render_bev.py --frame 294 --speed-profile docs/speed_profile.png
+```
