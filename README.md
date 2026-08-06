@@ -519,6 +519,18 @@ python3 -m kitti_nav.carla_bridge --host <box-ip> --port 2000 --target-speed 8
 proportional model) and `--rear-axle-x` to the sensor mount, then swapping the trained policy in
 behind the `BasePlanner` seam to reproduce the offline "0 collisions" guarantee in closed loop.
 
+### A second closed-loop path: the shield inside NVIDIA AlpaSim
+
+[`shield-in-alpasim`](https://github.com/matthewhamilton3141/shield-in-alpasim) wraps this
+repo's `safety_shield` as a driver plugin for
+[NVIDIA AlpaSim](https://github.com/NVlabs/alpasim), the open-source closed-loop AV validation
+harness released alongside NVIDIA's **Alpamayo** reasoning model — the question there is
+whether the shield still holds up in a harder, photorealistic environment it was never tuned
+on, eventually measured against AlpaSim's stock drivers. It's a scaffold, not yet functional:
+AlpaSim's driver interface is vision-only (camera frames in, trajectory waypoints out), which
+doesn't match the shield's per-step accel/steer + obstacle-field shape, and that gap is
+documented, not glossed over, in that repo's README.
+
 ## Layout
 
 ```
