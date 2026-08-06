@@ -9,7 +9,9 @@ Runs entirely on a laptop — pure NumPy + OpenCV, no GPU, no simulator install.
 > **Why occupancy and not Gaussian splats?** Production AV stacks make live driving decisions
 > on lidar/occupancy/BEV grids, not photorealistic reconstructions. Splatting's real role in
 > AV work is *offline* — turning recorded drives into replayable digital twins for
-> closed-loop testing. This repo keeps the live path on occupancy from the start.
+> closed-loop testing. This repo keeps the live path on occupancy, and now uses splatting in
+> exactly that offline role: a CARLA + NVIDIA **NuRec** bridge that renders recorded drives as
+> closed-loop test environments (see [Closed-loop in CARLA](#closed-loop-in-carla--nurec-scaffold)).
 
 ## Status
 
@@ -32,9 +34,11 @@ Runs entirely on a laptop — pure NumPy + OpenCV, no GPU, no simulator install.
 | Evasive steering (swerve out of an ICS rather than brake into it) | done, opt-in — **cleanly avoids an open-road obstacle it can't brake for; marginal on cluttered real traffic (46 → 45)** |
 | Training on real KITTI geometry (vs synthetic transfer) | done — **held-out shielded success 71% → 78% (+7 pts), raw collisions 52 → 40; shield still 0 collisions** |
 | Cross-drive validation on a second drive (0093) | done — **shield holds 0 collisions on a drive nothing was tuned on; dynamic shield reproduces; training doesn't generalise cross-drive (59% ≈ 58%); caught a fusion spawn-safety limitation** |
+| Closed-loop CARLA + NuRec bridge | scaffold — **runs the BEV + shield as a CARLA ego controller; handedness + "brakes for a wall dead ahead" tests green; policy hook stubbed, paused here** |
 
-**197 tests pass.** Dataset-backed tests skip cleanly when KITTI isn't downloaded; the
-environment core is pure NumPy and tests without any RL stack installed.
+**204 tests pass.** Dataset-backed tests skip cleanly when KITTI isn't downloaded; the
+environment core is pure NumPy and tests without any RL stack installed. The CARLA bridge's
+pure parts test with no `carla` package and no GPU.
 
 ## Quickstart
 
@@ -479,6 +483,42 @@ Seed-to-seed spread came out small (1.0–2.9 points), well under the deep-RL no
 variance swamps algorithmic differences — which is why 5 seeds sufficed to bound the effect.
 Caveats remain: one drive, one hyperparameter set, 600k steps.
 
+---
+
+## Closed-loop in CARLA + NuRec (scaffold)
+
+Every result above is **open-loop on frozen geometry**: the ego solves a navigation problem
+posed on a recorded scan, but its steering never changes what the sensor sees next. That is the
+right way to evaluate perception and the shield offline — but it is not yet *driving*. A recorded
+log can only ever show viewpoints the car actually visited, so it cannot answer "what would the
+sensor see if the policy steered somewhere the driver didn't?" Closing that loop needs a simulator
+that renders **novel viewpoints**.
+
+`src/kitti_nav/carla_bridge.py` is the client-side bridge to
+[CARLA](https://carla.readthedocs.io/) with NVIDIA's
+[NuRec](https://developer.nvidia.com/omniverse/nurec) neural reconstruction (3D Gaussian
+splatting — splatting in its proper offline role, exactly as the note at the top argues). Each
+tick pulls CARLA's simulated lidar, builds the same `BEVGrid`, runs the same `safety_shield`, and
+sends control back — so the exact code measured above drives in **closed loop**, on splat
+reconstructions of real drives, where the ego's own steering changes the next observation.
+
+The simulator + NuRec run on a GPU box (Linux, NVIDIA RTX); only this lightweight client runs
+locally. So its pure parts — the CARLA↔Velodyne handedness conversion (CARLA is left-handed,
++y right; kitti-nav is right-handed, +y left) and the shield→control actuator map — import and
+unit-test with **no `carla` package and no GPU**, including a closed-loop "brakes for a wall dead
+ahead" check that exercises the full BEV→shield path (`tests/test_carla_bridge.py`). The learned
+policy is intentionally not wired in yet: the shield wraps *any* base command, so the scaffold
+ships a trivial `ForwardGoalPlanner` and leaves a `BasePlanner` seam for the PPO policy.
+
+```bash
+# on the GPU box: launch CARLA + a NuRec scene, then from anywhere:
+python3 -m kitti_nav.carla_bridge --host <box-ip> --port 2000 --target-speed 8
+```
+
+**Paused here.** The next steps are calibrating CARLA's throttle→accel map (currently a simple
+proportional model) and `--rear-axle-x` to the sensor mount, then swapping the trained policy in
+behind the `BasePlanner` seam to reproduce the offline "0 collisions" guarantee in closed loop.
+
 ## Layout
 
 ```
@@ -490,6 +530,7 @@ src/kitti_nav/bev.py         lidar -> BEV occupancy + distance field (ObstacleFi
 src/kitti_nav/mapping.py     pose + scan fusion into an accumulated map; ego self-filter
 src/kitti_nav/nav_env.py     driving nav environment + scene sources + baseline policy
 src/kitti_nav/nav_gym.py     the only module importing gymnasium
+src/kitti_nav/carla_bridge.py  BEV + shield as a CARLA (+ NuRec) closed-loop ego controller
 scripts/fetch_kitti.py       dataset download (data is never committed)
 scripts/eval_odometry.py     run VO over a drive, score it, plot it
 scripts/eval_mapping.py      single vs GT-pose vs VO-pose maps; --audit-ego, --sweep
