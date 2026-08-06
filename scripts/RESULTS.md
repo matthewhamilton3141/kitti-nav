@@ -81,6 +81,69 @@ python3 scripts/eval_kitti_trained.py --episodes 200 \
   --model synthetic=models/ppo_shielded.zip --model kitti=models/ppo_kitti_shielded.zip
 ```
 
+## Cross-drive validation — a second drive (0093) nothing was tuned or trained on
+
+Every result above is on drive 0009. The sharpest test of a *method* is a drive it never saw, so
+this repeats the evals on **drive 0093** — a busier, faster city sequence (433 frames, 595 m vs
+0009's 333 m; **65 moving actors** vs 12; 20% mean occupancy vs 8%). No parameter, threshold, or
+policy was ever tuned on it. Three things came out, one of them a limitation the test existed to
+find.
+
+**1. The shield's guarantee holds on an unseen drive.** Single-scan maps, all 433 frames, 200
+episodes:
+
+| policy | raw | + shield at eval |
+| --- | ---: | ---: |
+| gap-following | 40% / 122 coll | 49% / **0** |
+| synthetic-trained | 64% / 73 | 58% / **0** |
+| 0009-trained | 62% / 78 | 59% / **0** |
+
+**0 collisions in every shielded column, on a drive nothing was tuned against** — the strongest
+form of the central claim: the certificate is re-derived from whatever occupancy it is handed, so
+it transfers where a *policy* need not.
+
+**2. The dynamic shield reproduces on different traffic.** 0093's crossing encounters, 200
+episodes:
+
+| gap-following | collisions | mover-hits | drove in | run into |
+| --- | ---: | ---: | ---: | ---: |
+| unshielded | 107 | 13 | 13 | 0 |
+| static shield | 18 | 16 | **14** | 2 |
+| dynamic shield | 13 | 10 | **4** | 6 |
+
+Same pattern as 0009: the static shield drives into crossing cars (14), the dynamic shield cuts
+that to 4, its residual hits mostly a mover striking a stopped ego. The moving-world result was
+not a fluke of one drive.
+
+**3. Training on real geometry did *not* generalise across drives — stated honestly.** The
+0009-trained policy scores **59% on 0093, statistically level with synthetic transfer's 58%** (and
+below both on raw, 62 vs 64). So the +7-point within-drive gain on 0009 was **partly 0009-specific
+structure**, not a portable driving skill — exactly the risk the "one drive" caveat named, now
+measured. Training on real geometry helps *on that geometry*; it is not a free lunch elsewhere.
+
+### The limitation the cross-drive test caught: fusion is not spawn-safe on every drive
+
+The **fused**-map eval could not be run honestly on 0093: the ego spawns already in collision on
+27/30 sampled frames (single-scan: 0/30). Fusing 0093's 5-scan window — ~5.4 m of travel at this
+speed, through dense traffic — deposits **elevated** geometry (z median 1.12 m, not a
+ground-removal artifact) from adjacent viewpoints into the ego's own spawn footprint: 143 occupied
+cells within 2 m of the ego, versus 0 single-scan. Carving does not retire it (the height gate
+that keeps carving safe spares exactly these elevated returns), and a post-fusion ego-box clear
+does not either (the smear surrounds the ego, it is not the ego's body). This is the accumulation
+smear the docs already flag, made acute by a fast, mover-dense drive — and it breaks the
+certifiable-start precondition the "0 collisions" claim rests on. The honest reading: **the
+single-scan map transfers cleanly; the accumulated map needs per-drive validation before it is
+spawn-safe.** A dynamic channel that forgets movers (or a spawn-clearance guard in the scene
+sampler) is the fix; both are noted as follow-ups, not done here.
+
+Reproduce (needs the second drive — `python3 scripts/fetch_kitti.py --drive 0093 --tracklets`):
+
+```bash
+python3 scripts/eval_kitti_trained.py --drive 0093 --all-frames --fused-window 1 --episodes 200 \
+  --model synthetic=models/ppo_shielded.zip --model kitti-0009=models/ppo_kitti_shielded.zip
+python3 scripts/eval_dynamic_policies.py --drive 0093 --episodes 200
+```
+
 ## What holds
 
 **The shield's guarantee is absolute across every run: 0 collisions, always.** That covers a

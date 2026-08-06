@@ -31,6 +31,7 @@ Runs entirely on a laptop — pure NumPy + OpenCV, no GPU, no simulator install.
 | Closed-loop dynamic traffic (movers step while a policy drives) | done — **on 0009's crossing cars the static shield drives in 51×, the dynamic shield 4×; its residual hits are movers striking a stopped ego, all ics-flagged** |
 | Evasive steering (swerve out of an ICS rather than brake into it) | done, opt-in — **cleanly avoids an open-road obstacle it can't brake for; marginal on cluttered real traffic (46 → 45)** |
 | Training on real KITTI geometry (vs synthetic transfer) | done — **held-out shielded success 71% → 78% (+7 pts), raw collisions 52 → 40; shield still 0 collisions** |
+| Cross-drive validation on a second drive (0093) | done — **shield holds 0 collisions on a drive nothing was tuned on; dynamic shield reproduces; training doesn't generalise cross-drive (59% ≈ 58%); caught a fusion spawn-safety limitation** |
 
 **197 tests pass.** Dataset-backed tests skip cleanly when KITTI isn't downloaded; the
 environment core is pure NumPy and tests without any RL stack installed.
@@ -430,6 +431,21 @@ collisions down 52 → 40 — recovering about half of what the transfer cost. *
 certificate is a property of the method, not the training distribution. Full table and the
 `train_ppo.py --scenes kitti-fused` command in [`scripts/RESULTS.md`](scripts/RESULTS.md). (Still
 one drive — this is within-drive generalisation to a later stretch, not cross-drive.)
+
+### Cross-drive: the shield transfers, the trained policy does not
+
+To turn "one drive" into a generalisation claim I ran the evals on a **second drive (0093)** — a
+busier, faster sequence (65 moving actors vs 12) that nothing was ever tuned or trained on. The
+shield holds **0 collisions on every shielded row** there too, which is the strongest form of the
+claim: unlike a policy, the certificate re-derives from whatever occupancy it is handed, so it
+transfers by construction. The dynamic-shield result reproduces as well (static shield drives into
+14 crossing cars, dynamic into 4). But the 0009-*trained* policy scores **59% on 0093 — level with
+synthetic transfer's 58%**: the +7-point within-drive gain was partly 0009-specific structure, not
+a portable skill, exactly the risk the "one drive" caveat named. And the cross-drive test earned
+its keep by catching a limitation: the *fused* map spawns the ego in collision on this fast,
+mover-dense drive (elevated geometry smeared into the spawn footprint from adjacent viewpoints), so
+the accumulated map needs per-drive validation before it is spawn-safe — the single-scan map does
+not. Details in [`scripts/RESULTS.md`](scripts/RESULTS.md).
 
 ### A negative result, replicated across 5 training seeds
 

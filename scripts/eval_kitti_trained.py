@@ -4,11 +4,17 @@
     python3 scripts/eval_kitti_trained.py --episodes 200 \
         --model synthetic=models/ppo_shielded.zip --model kitti=models/ppo_kitti_shielded.zip
 
+    # cross-drive: score 0009-trained policies on a whole different drive they never saw
+    python3 scripts/eval_kitti_trained.py --drive 0093 --all-frames --episodes 200 \
+        --model synthetic=models/ppo_shielded.zip --model kitti-0009=models/ppo_kitti_shielded.zip
+
 Every published policy here was trained on synthetic obstacle fields and *transferred* to KITTI.
 The obvious untried lever is to train on the drive's own recorded occupancy instead. This scores
 each policy on the **held-out** half of a contiguous frame split (`kitti_frame_split`) — the
 stretch of the drive no policy trained on — so the comparison is genuine generalisation, not
-memorisation. Each model is run three ways, the same arc as `eval_policies.py`:
+memorisation. With `--all-frames` on a *different* drive it becomes a cross-drive test: nothing
+was trained on any of that drive, so the whole of it is fair to score on. Each model is run three
+ways, the same arc as `eval_policies.py`:
 
   * **raw** — the policy alone;
   * **+ shield at eval** — the braking shield bolted on only at evaluation;
@@ -62,6 +68,9 @@ def main() -> int:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--holdout", type=float, default=0.3,
                    help="must match the split the policies were trained with")
+    p.add_argument("--all-frames", action="store_true",
+                   help="score on the whole drive, not a held-out split — the honest choice for "
+                        "a cross-drive test, where no policy was trained on any of this drive")
     p.add_argument("--fused-window", type=int, default=5)
     p.add_argument("--model", action="append", default=[], metavar="NAME=PATH",
                    help="a named policy to score (repeatable), e.g. synthetic=models/ppo.zip")
@@ -71,13 +80,23 @@ def main() -> int:
     from kitti_nav.mapping import MapConfig
 
     drive = KittiDrive(args.date, args.drive)
-    train, test = kitti_frame_split(drive.n_velodyne, holdout=args.holdout)
-    print(f"drive {args.drive}: {drive.n_velodyne} frames -> "
-          f"{len(train)} train / {len(test)} held-out (last {args.holdout:.0%})\n"
-          f"scoring on held-out, fused {args.fused_window} scans, {args.episodes} episodes\n")
+    mapdesc = f"fused {args.fused_window} scans" if args.fused_window > 1 else "single scan"
+    if args.all_frames:
+        eval_frames = np.arange(drive.n_velodyne)
+        print(f"drive {args.drive}: scoring on ALL {drive.n_velodyne} frames "
+              f"(cross-drive — nothing trained here), {mapdesc}, {args.episodes} episodes\n")
+    else:
+        train, eval_frames = kitti_frame_split(drive.n_velodyne, holdout=args.holdout)
+        print(f"drive {args.drive}: {drive.n_velodyne} frames -> "
+              f"{len(train)} train / {len(eval_frames)} held-out (last {args.holdout:.0%})\n"
+              f"scoring on held-out, {mapdesc}, {args.episodes} episodes\n")
 
-    scenes = KittiScenes(drive=drive, frames=test,
-                         map_config=MapConfig(window=args.fused_window))
+    # window <= 1 means the single-scan map (no fusion). This matters cross-drive: fusing a fast
+    # drive's wide-baseline window can paint phantom geometry into the ego's own spawn region
+    # (a ground-removal-under-multiple-viewpoints artifact), which single-scan avoids.
+    map_config = MapConfig(window=args.fused_window) if args.fused_window > 1 else None
+    scenes = KittiScenes(drive=drive, frames=eval_frames, map_config=map_config,
+                         grid_cache_size=len(eval_frames) + 1)
     base = DriveNavConfig()
     shielded = replace(base, use_shield=True)
 

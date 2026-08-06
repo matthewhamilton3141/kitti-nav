@@ -28,6 +28,7 @@ DRIVES = {
     "0005": "city, 154 frames — smallest useful drive, good for fast iteration",
     "0009": "city, 447 frames — default: long enough for real trajectory drift",
     "0027": "road, 188 frames — higher speed, tests the braking shield harder",
+    "0093": "city, 433 frames — busy traffic; the cross-drive generalisation test",
 }
 
 
@@ -107,6 +108,15 @@ def fetch_tracklets(date: str, drive: str, keep_zip: bool) -> Path:
         z.extractall(DATA_DIR)
     if not keep_zip:
         zip_path.unlink()
+
+    # Some drives' tracklet zips are nested (`2011_09_26/..._sync/tracklet_labels.xml`) and
+    # land in place; others are flat (just `tracklet_labels.xml`) and extract to the data root.
+    # Move a flat one into the drive directory so `KittiDrive.tracklets` finds it either way.
+    if not out.exists():
+        stray = DATA_DIR / "tracklet_labels.xml"
+        if stray.exists():
+            out.parent.mkdir(parents=True, exist_ok=True)
+            stray.replace(out)
     print(f"ready: {out}")
     return out
 

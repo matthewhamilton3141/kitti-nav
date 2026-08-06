@@ -8,28 +8,62 @@ notes — what was decided and why, what broke, and what is actually left.
 # ▶ START HERE — next step for a cleared session
 
 **Where things stand.** **197 tests green** (`python3 -m pytest tests/ -q`; dataset tests skip
-without KITTI). Three things done since the last clear, on `feat/map-fusion` = `main` (they
+without KITTI). Four things done since the last clear, on `feat/map-fusion` = `main` (they
 coincide — the old divergence was resolved by a fast-forward, `02a1098..12f6d73`, and pushed):
 
 1. **Closed-loop dynamic env (option 3a) — DONE and committed** (`12f6d73`).
 2. **Evasive steering in the shield (option 5) — DONE and committed** (`6434233`).
-3. **Training on real KITTI geometry (option 7) — DONE, uncommitted at time of writing.** The
-   working tree has changes to `train_ppo.py`, `nav_env.py` (+`kitti_frame_split`), `test_nav_env.py`,
-   a new `scripts/eval_kitti_trained.py`, plus doc updates (README / RESULTS / this file). See the
-   session note directly below. Committing is the first action for whoever picks this up. (The
-   trained models `models/ppo_kitti_{raw,shielded}.zip` are gitignored — reproducible in ~13 min.)
+3. **Training on real KITTI geometry (option 7) — DONE and committed** (`4f753aa`; README voice
+   fix `05dd89e`).
+4. **Cross-drive validation on a second drive (0093) — DONE, uncommitted at time of writing.**
+   Working tree has changes to `fetch_kitti.py`, `eval_kitti_trained.py`, plus doc updates
+   (README / RESULTS / this file). See the session note directly below. Committing is the first
+   action for whoever picks this up. (Drive 0093 data is gitignored; re-fetch with
+   `python3 scripts/fetch_kitti.py --drive 0093 --tracklets`.)
 
 Latest committed commits, newest first:
 
 ```
+05dd89e docs: write the gsplat-rt references in first person, as my own prior project
+4f753aa feat: train a policy on real KITTI geometry — recover half the transfer gap
 6434233 feat: opt-in evasive steering — swerve out of an ICS instead of braking into it
 12f6d73 feat: closed-loop dynamic env — static vs dynamic shield on moving traffic
-cb9d669 docs: add START HERE block to the handoff for the next cleared session
-18ada5e feat: dynamic shield — braking for where a moving obstacle is going (stage 2)
 ```
 
 Everything below the `▶` block is the deep record (session write-ups, then decisions, bugs,
 gaps, env facts). Read this block, then dip into those as needed — they are accurate and current.
+
+## ✅ DONE this session: cross-drive validation on a second drive (0093)
+
+To turn the pile of "one drive" caveats into a generalisation claim, I fetched a **second drive,
+0093** (busier/faster: 433 frames, 595 m, **65 moving actors** vs 0009's 12, 20% occupancy vs 8%)
+and re-ran the evals on it — nothing was ever tuned or trained on it. Three findings, one a
+limitation the test existed to catch:
+
+1. **The shield's 0-collision guarantee holds cross-drive.** Single-scan, all 433 frames, 200
+   episodes: gap-following / synthetic / 0009-trained all get **0 collisions shielded** (raw:
+   122 / 73 / 78). The certificate transfers where a policy need not.
+2. **The dynamic shield reproduces.** On 0093's crossing traffic the static shield drives into 14
+   crossing cars, the dynamic shield 4 (collisions 18→13) — same pattern as 0009.
+3. **Training did NOT generalise cross-drive (honest tempering).** The 0009-trained policy scores
+   **59% on 0093, level with synthetic transfer's 58%** — the +7-pt within-drive gain was partly
+   0009-specific structure, not a portable skill. Exactly the "one drive" risk, now measured.
+
+**The limitation it caught — fusion is not spawn-safe on every drive.** The *fused*-map eval could
+not run honestly on 0093: the ego spawns already in collision (27–28/30 frames; single-scan 0/30).
+Fusing 0093's wide, mover-dense 5-scan window deposits **elevated** geometry (z median 1.12 m — not
+ground-removal) from adjacent viewpoints into the ego's own spawn footprint (143 occ cells within
+2 m of ego vs 0 single-scan). Carving does not retire it (its height gate spares elevated returns
+by design), and a post-fusion ego-box clear does not either (the smear surrounds the ego, is not
+its body). So `eval_kitti_trained.py` grew a `--fused-window 1` (single-scan) path, and the
+cross-drive table is single-scan. **Fix for later:** a dynamic channel that forgets movers, or a
+spawn-clearance guard in the scene sampler. **Also fixed this session:** 0093's tracklet zip is
+*flat* (just `tracklet_labels.xml`), so `fetch_kitti.py` extracted labels to the data root — now
+it relocates them into the drive dir.
+
+Reproduce: `python3 scripts/fetch_kitti.py --drive 0093 --tracklets`, then
+`python3 scripts/eval_kitti_trained.py --drive 0093 --all-frames --fused-window 1 --episodes 200 --model synthetic=models/ppo_shielded.zip --model kitti-0009=models/ppo_kitti_shielded.zip`
+and `python3 scripts/eval_dynamic_policies.py --drive 0093 --episodes 200`.
 
 ## ✅ DONE this session: training on real KITTI geometry (option 7)
 
@@ -327,7 +361,8 @@ ported unchanged, and one of its headline results did not reproduce (below).
 | **Dynamic shield: braking for an obstacle's predicted path** | done — *on the branch* | **static shield crashes a crossing car the dynamic one stops clear of; binds on 8% of real mover-frames (worst −8.3 m/s)** |
 | **Closed-loop dynamic env: movers step while a policy drives** | done — *on the branch* | **on 0009's 91 crossing encounters the static shield drives in 51×, the dynamic shield 4×; residual hits are movers striking a stopped ego, all ics-flagged** |
 | **Evasive steering: swerve out of an ICS instead of braking into it** | done, opt-in — *on the branch* | **open-road: cleanly avoids an obstacle it can't brake for; real traffic: marginal (dyn-shield coll 46→45), room to swerve usually absent** |
-| **Training a policy on real KITTI geometry (vs synthetic transfer)** | done — *on the branch, uncommitted* | **held-out shielded success 71%→78% (+7 pts), raw collisions 52→40; shield 0 collisions in every column** |
+| **Training a policy on real KITTI geometry (vs synthetic transfer)** | done — *on the branch* | **held-out shielded success 71%→78% (+7 pts), raw collisions 52→40; shield 0 collisions in every column** |
+| **Cross-drive validation on a second drive (0093)** | done — *on the branch, uncommitted* | **shield 0 collisions on a drive nothing was tuned on; dynamic shield reproduces; training doesn't generalise (59%≈58%); caught a fusion spawn-safety limitation** |
 
 Full numbers: `README.md` and `scripts/RESULTS.md`.
 
@@ -587,28 +622,32 @@ Seed spread was small (1.0–2.9 pts), unusually low for deep RL. Sweep cost ~35
   threading parked cars with 0.03 m modelled clearance.
 - **VO has no bundle adjustment, keyframing, or loop closure** — error accumulates
   monotonically. 3.55% is respectable, not SOTA.
-- **One drive, one hyperparameter set.** ⚠ Now doubly relevant: the KITTI-trained result (option 7,
-  this session) is **within-drive** — trained on 0009's first 70%, scored on its last 30%. Genuine
-  held-out road, but not *cross-drive*. A second drive is what would turn it into a generalisation
-  claim.
-- **✅ (mostly) — training on real geometry is done.** A policy now trains on fused KITTI (train
-  split) and recovers ~half the transfer gap on held-out frames (71%→78% shielded). What is *not*
-  done: training on the **dynamic** scenes (`KittiDynamicScenes`), and the cross-drive test above.
+- **Two drives now, not one — but generalisation is mixed.** Cross-drive (0093) is done: the
+  **shield** transfers cleanly (0 collisions on an unseen drive), but the **trained policy does
+  not** (0009-trained ≈ synthetic on 0093). So "trained on real geometry" is drive-specific, not a
+  portable skill. Still two drives, one calib day, one hyperparameter set.
+- **⚠ NEW — fusion is not spawn-safe on every drive.** On 0093 the fused map spawns the ego in
+  collision (elevated smear into the spawn footprint; single-scan is clean). Carving can't fix it
+  (height gate), nor a post-fusion ego-box clear (not the ego body). The fix is a dynamic mover-
+  forgetting channel or a spawn-clearance guard in the scene sampler — **not done**. Until then the
+  accumulated-map eval needs per-drive checking; `eval_kitti_trained.py --fused-window 1` sidesteps
+  it with single-scan.
 - **The seed sweep has not been re-run on fused maps** (single-scan only), nor on the KITTI-trained
   policies — the +7-pt training result is one seed each. A seed sweep would firm it up (~13 min/run).
+- **Training on the dynamic scenes (`KittiDynamicScenes`) is still untried.**
 
 ## What next — options
 
-**Update: options 1, 2, 3 (incl. 3a), 5 (evasive), and now 7 (train on real geometry) are done.**
-The branch/`main` divergence is resolved (fast-forward). See the START HERE session notes.
-**My recommendation now: a second drive.** Nearly every remaining caveat is "one drive" — the
-KITTI-trained result is within-drive, the seed sweep is single-scan-only, generalisation is
-unproven across scenes. Adding one more KITTI drive (another `fetch_kitti.py`) and re-running the
-transfer / trained / dynamic evals on it would convert a stack of within-drive results into a
-generalisation claim, and is mostly wiring. Secondary: train on the **dynamic** scenes
-(`KittiDynamicScenes`) too, or seed-sweep the KITTI-trained policies (~13 min/run) to firm up the
-+7-pt number. The one *new-theory* item left is evasive steering's sustained-brake-turn
-certificate, but it is niche given how cluttered real streets are.
+**Update: options 1, 2, 3 (incl. 3a), 5 (evasive), 7 (train on real geometry), and cross-drive
+validation are all done.** The branch/`main` divergence is resolved (fast-forward). See the START
+HERE session notes. **My recommendation now: fix fusion spawn-safety, then either a spawn-clearance
+guard or a dynamic mover-forgetting channel.** The cross-drive test exposed that the accumulated
+map paints elevated smear into the ego's spawn footprint on a fast, mover-dense drive — the single
+concrete correctness gap left, and it blocks the fused-map eval on new drives. A **dynamic channel
+that marks-and-forgets movers** (tracklet labels or a two-frame occupancy diff) is the principled
+fix and doubles as the long-standing "dedicated dynamic channel" gap. Secondary: seed-sweep the
+KITTI-trained policies to firm up +7 pts; train on `KittiDynamicScenes`; or a third drive. The one
+*new-theory* shield item left is evasive steering's sustained-brake-turn certificate, still niche.
 
 1. **✅ DONE — softer unknown semantics, so the honest map is drivable.** The **cautious speed
    cap** plus **hole-closing** takes hard-block's 4% to 34–40% with the shield still at 0
@@ -641,7 +680,8 @@ certificate, but it is niche given how cluttered real streets are.
 - Dev Mac runs **everything**: numpy, OpenCV, and the RL stack — **torch 2.13 + sb3 2.9 +
   gymnasium 1.3, CPU**. No GPU needed anywhere in this repo.
 - Data: `data/kitti_raw/` is **gitignored, never committed** (KITTI is CC BY-NC-SA 3.0,
-  non-commercial). Refetch: `python3 scripts/fetch_kitti.py`. Drive 0009 is ~1.7 GB.
+  non-commercial). Refetch: `python3 scripts/fetch_kitti.py`. Drive 0009 is ~1.7 GB; the
+  cross-drive second drive **0093** is ~1.6 GB (`--drive 0093 --tracklets`, 433 frames, busy).
 - `models/` is gitignored; retrain via `scripts/train_ppo.py` (1.5 min raw, ~5 min shielded).
 - Tests: `python3 -m pytest tests/ -q`. Dataset-backed tests skip cleanly without KITTI; the
   env core is pure NumPy and tests with no RL stack installed.
@@ -688,6 +728,12 @@ python3 scripts/eval_policies.py --episodes 200 --carve --fused-window 5
 python3 scripts/train_ppo.py --scenes kitti-fused --shield --steps 600000 --out models/ppo_kitti_shielded
 python3 scripts/eval_kitti_trained.py --episodes 200 \
   --model synthetic=models/ppo_shielded.zip --model kitti=models/ppo_kitti_shielded.zip
+
+# cross-drive: fetch a second drive, then score 0009-trained policies on all of it (single-scan)
+python3 scripts/fetch_kitti.py --drive 0093 --tracklets
+python3 scripts/eval_kitti_trained.py --drive 0093 --all-frames --fused-window 1 --episodes 200 \
+  --model synthetic=models/ppo_shielded.zip --model kitti-0009=models/ppo_kitti_shielded.zip
+python3 scripts/eval_dynamic_policies.py --drive 0093 --episodes 200   # dynamic shield, cross-drive
 
 python3 scripts/eval_odometry.py --plot docs/trajectory.png
 python3 scripts/render_bev.py --frame 294 --speed-profile docs/speed_profile.png
