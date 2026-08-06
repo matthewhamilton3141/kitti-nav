@@ -50,7 +50,7 @@ def render_frame(drive: KittiDrive, i: int, out: Path, vcfg: VehicleConfig) -> N
     # Distance field as background, occupancy on top. Forward (+x) is up, left (+y) is left,
     # so the plot reads like a map from the driver's seat.
     dist = np.where(np.isinf(grid.distance_field), np.nan, grid.distance_field)
-    extent = [cfg.y_max, cfg.y_min, cfg.x_min, cfg.x_max]      # y reversed: +y is left
+    extent = [cfg.y_min, cfg.y_max, cfg.x_min, cfg.x_max]      # col 0 = y_min; axis inverted below
     ax_bev.imshow(dist, origin="lower", extent=extent, cmap="Blues", vmin=0, vmax=15,
                   aspect="equal")
     occ = np.ma.masked_where(grid.occupancy == 0, grid.occupancy)
@@ -71,6 +71,7 @@ def render_frame(drive: KittiDrive, i: int, out: Path, vcfg: VehicleConfig) -> N
                 "g-", lw=2.5, alpha=0.8,
                 label=f"braking envelope at {state.v:.1f} m/s ({d_stop:.0f} m)")
 
+    ax_bev.invert_xaxis()   # +y (left) on the visual left, matching the camera
     ax_bev.set_xlabel("y, left (m)")
     ax_bev.set_ylabel("x, forward (m)")
     ax_bev.set_title(f"lidar BEV occupancy — driven {state.v:.1f} m/s, "
@@ -134,8 +135,9 @@ def render_rollout(drive: KittiDrive, out: Path, model_path: Path, frame: int,
     fig, ax = plt.subplots(figsize=(9, 11))
     occ = np.ma.masked_where(env.scenes.sample(np.random.default_rng(0)).grid.occupancy == 0,
                              np.ones(bev.shape))
-    ax.imshow(occ, origin="lower", extent=[bev.y_max, bev.y_min, bev.x_min, bev.x_max],
+    ax.imshow(occ, origin="lower", extent=[bev.y_min, bev.y_max, bev.x_min, bev.x_max],
               cmap="autumn_r", vmin=0, vmax=1, aspect="equal", interpolation="nearest")
+    ax.invert_xaxis()   # +y (left) on the visual left; matches the true-y trajectories below
 
     reached = 0
     for ep in range(n_episodes):
