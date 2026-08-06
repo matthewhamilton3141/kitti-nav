@@ -10,10 +10,14 @@ runbook for running/watching everything yourself.
 ## ▶ Where things stand
 
 - **Branch `feat/map-fusion` = `main`** (they coincide; both pushed to origin). Latest commit
-  `6f7a3fe`. Working tree clean.
-- **197 tests green**: `python3 -m pytest tests/ -q` (dataset-backed tests skip cleanly without
-  KITTI; the env core is pure NumPy).
+  `e1a8958`. Working tree clean.
+- **204 tests green**: `python3 -m pytest tests/ -q` (dataset-backed tests skip cleanly without
+  KITTI; the env core is pure NumPy). The CARLA bridge's pure parts test with no `carla`/GPU.
 - **Two KITTI drives on disk** (gitignored): 0009 (default, city) and 0093 (cross-drive, busy).
+- **Direction has shifted to closed-loop.** The offline arc is a good stopping point; the new
+  thread is running the BEV + shield in a real closed loop via **CARLA + NuRec** — see the next
+  step. A client-side bridge (`src/kitti_nav/carla_bridge.py`) already exists; the rest needs a
+  GPU box. Paused here.
 
 > **To run or watch the tests/evals → jump to [▶ Run & watch — runbook](#-run--watch--runbook)
 > below.** It has every command, its runtime, what "good" looks like, and how to `tail -f` a long
@@ -43,27 +47,44 @@ of. Pure NumPy/OpenCV core + CPU RL; runs entirely on the Mac. Public:
 | Evasive steering (opt-in) | done | swerves out of an open-road ICS; marginal on cluttered real traffic |
 | Training on real KITTI geometry | done | held-out shielded success 71% → **78% (+7 pts)** |
 | **Cross-drive validation (drive 0093)** | done | **shield transfers (0 collisions on an unseen drive); trained policy does *not* (59%≈58%)** |
+| BEV render mirror fix | done | render/animation BEV was L/R mirrored (`imshow` col-0 vs `extent`); un-mirrored, occ/trajectory overlays realigned |
+| **Closed-loop CARLA + NuRec bridge** | scaffold | **BEV + shield as a CARLA ego controller; handedness + "brakes for a wall" tests green; PPO hook stubbed** |
 
 Full numbers: [`README.md`](README.md) and [`scripts/RESULTS.md`](scripts/RESULTS.md).
 
 ## ▶ The next step
 
-**Fix fusion spawn-safety, via a dynamic mover-forgetting channel.** The cross-drive test caught
-the one concrete correctness gap left: on the fast, mover-dense drive 0093 the **fused** map
-spawns the ego already in collision (27/30 frames; single-scan 0/30) — the wide 5-scan window
-smears *elevated* geometry (z median 1.12 m, not ground removal) from adjacent viewpoints into the
-ego's spawn footprint. Carving can't retire it (its height gate spares elevated returns), and a
-post-fusion ego-box clear doesn't (the smear surrounds the ego, isn't its body).
+**Close the loop in CARLA + NuRec.** Everything measured so far is *open-loop on frozen geometry*:
+the ego solves a nav problem posed on a recorded scan, but its steering never changes what the
+sensor sees next — and a recorded log can't render the viewpoints the driver didn't visit. The
+move is to a simulator that renders novel viewpoints: **CARLA** (v0.9.16) with NVIDIA **NuRec**
+neural reconstruction (3D Gaussian splatting of real drives), so the exact BEV + shield code drives
+in a genuine closed loop where the policy's own steering shapes the next observation.
 
-The principled fix is a **dedicated dynamic channel** that marks-and-forgets movers (tracklet
-labels, or a two-frame occupancy diff) without touching static geometry. It would (a) make the
-accumulated map spawn-safe cross-drive, unblocking the fused-map eval on new drives, and (b) close
-the long-standing "dynamic actors smear under accumulation" gap. Interim workaround already in
-place: `eval_kitti_trained.py --fused-window 1` scores single-scan, which is spawn-safe.
+The client-side bridge already exists — `src/kitti_nav/carla_bridge.py` (CARLA lidar → `BEVGrid` →
+`safety_shield` → CARLA control), with its pure parts tested on the Mac (no `carla`, no GPU). What
+remains needs a **GPU box** (Linux, NVIDIA RTX — CARLA + NuRec do *not* run on the Mac; the plan is
+a cloud instance):
 
-Secondary options: seed-sweep the KITTI-trained policies (+7 pts is one seed); train on
-`KittiDynamicScenes`; a third drive; evasive steering's sustained-brake-turn certificate
-(new theory, niche). See the archive's "What next" for the full menu.
+1. Provision the box; install CARLA 0.9.16 + NuRec + the NVIDIA Container Toolkit; pull the ~200 GB
+   NVIDIA Physical AI NuRec dataset. **Use the ready dataset first** to prove the loop; reconstruct
+   a KITTI drive (COLMAP → 3DGUT) later so closed-loop numbers match the offline ones.
+2. Calibrate the two approximations flagged in the code: CARLA's throttle→accel map (currently
+   proportional) in `shield_to_carla_control`, and `--rear-axle-x` to the sensor mount.
+3. Swap `ForwardGoalPlanner` for the trained PPO policy behind the `BasePlanner` seam and reproduce
+   the offline **"0 collisions"** guarantee in closed loop.
+
+**Still-open correctness gap (secondary — was the previous "next step").** Fusion spawn-safety on
+fast/busy drives: on 0093 the **fused** 5-scan map spawns the ego already in collision (27/30
+frames; single-scan 0/30) — the wide window smears *elevated* geometry (z median 1.12 m, not ground
+removal) into the ego's spawn footprint. Carving can't retire it (height gate spares elevated
+returns), nor a post-fusion ego-box clear (the smear surrounds the ego, isn't its body). Principled
+fix: a **dedicated dynamic mover-forgetting channel** (tracklet labels, or a two-frame occupancy
+diff) that leaves static geometry untouched. Interim workaround in place:
+`eval_kitti_trained.py --fused-window 1` scores single-scan, which is spawn-safe.
+
+Other options: seed-sweep the KITTI-trained policies (+7 pts is one seed); train on
+`KittiDynamicScenes`; a third drive. See the archive's "What next" for the full menu.
 
 ---
 
@@ -119,11 +140,28 @@ python3 scripts/eval_policies.py --episodes 200 > /tmp/eval.log 2>&1 &
 tail -f /tmp/eval.log        # Ctrl-C to stop watching; the job keeps running
 ```
 
-### See the shield actually drive (pictures)
+### See the shield actually drive (pictures & video)
 
 ```bash
 python3 scripts/render_bev.py --frame 294 --speed-profile docs/speed_profile.png
 python3 scripts/eval_odometry.py --plot docs/trajectory.png
+python3 scripts/animate_drive.py --drive 0009 --start 40 --stop 200 --out docs/drive_scene.mp4
+python3 scripts/animate_rollout.py --frame 60 --out docs/drive.mp4   # shielded PPO rollout movie
+```
+
+The BEV mini-map in these was left-right **mirrored** until `2db8a7c` (`imshow` draws array col-0
+at `extent[0]`, but the rasteriser puts world-right there) — now un-mirrored; the camera's left is
+the map's left. If a render ever looks flipped again, that's the extent/axis coupling in the render
+scripts, not the perception.
+
+### Closed-loop in CARLA (needs a GPU box — not runnable on the Mac)
+
+The bridge's pure parts test locally; the loop itself needs CARLA + NuRec on a Linux NVIDIA-RTX box.
+
+```bash
+python3 -m pytest tests/test_carla_bridge.py -q   # sign conventions + "brakes for a wall", no carla/GPU
+# on the box, with CARLA 0.9.16 + a NuRec scene running:
+python3 -m kitti_nav.carla_bridge --host <box-ip> --port 2000 --target-speed 8
 ```
 
 ---
@@ -140,9 +178,14 @@ python3 scripts/eval_odometry.py --plot docs/trajectory.png
   evasive steering, fused maps) so every prior number reproduces. Keep that discipline.
 - **Numbers are re-measured, not inherited.** If a doc figure disagrees with what you measure,
   trust the measurement and correct the doc. Several claims were corrected downward this way.
-- **Two open correctness/perception gaps:** fusion spawn-safety on fast/busy drives (the next
-  step), and label-free obstacle velocity is ~95% false-positive (so the dynamic shield runs on
-  tracklet motion, not label-free — measured, not assumed).
+- **Two open correctness/perception gaps:** fusion spawn-safety on fast/busy drives (now the
+  *secondary* next step), and label-free obstacle velocity is ~95% false-positive (so the dynamic
+  shield runs on tracklet motion, not label-free — measured, not assumed).
+- **CARLA + NuRec is a GPU-box job.** The bridge (`carla_bridge.py`) is deliberately split so the
+  shield/BEV/handedness/actuator logic is pure and Mac-testable; `import carla` is lazy, only inside
+  `CarlaBridge`. CARLA (Unreal, left-handed, +y right, +steer right) ↔ kitti-nav (right-handed,
+  +y left, +steer left): the two sign flips live in `carla_lidar_to_velodyne` and
+  `shield_to_carla_control`, pinned by tests. The PPO policy plugs in behind the `BasePlanner` seam.
 
 For anything not covered here — the bug write-ups, the rejected approaches, the per-session
 reasoning — see [`docs/HANDOFF-archive.md`](docs/HANDOFF-archive.md).
