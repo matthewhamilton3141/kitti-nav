@@ -15,6 +15,10 @@ runbook for running/watching everything yourself.
   KITTI; the env core is pure NumPy).
 - **Two KITTI drives on disk** (gitignored): 0009 (default, city) and 0093 (cross-drive, busy).
 
+> **To run or watch the tests/evals → jump to [▶ Run & watch — runbook](#-run--watch--runbook)
+> below.** It has every command, its runtime, what "good" looks like, and how to `tail -f` a long
+> eval so you can watch it stream without blocking your terminal.
+
 **What this is.** AV navigation on real recorded KITTI drives: replay a sequence, build the
 lidar→BEV occupancy a real stack plans on, and drive a bicycle-model vehicle through it behind a
 **braking-aware safety shield** that provably cannot admit a collision it could have braked out
