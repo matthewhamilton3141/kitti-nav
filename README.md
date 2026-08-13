@@ -4,7 +4,30 @@ Autonomous-driving navigation on real recorded drives: replay a KITTI sequence, 
 occupancy/BEV representation a real AV stack plans on, and drive a vehicle through it behind
 a **hard safety shield** that provably cannot admit a collision it could have braked out of.
 
-Runs entirely on a laptop — pure NumPy + OpenCV, no GPU, no simulator install.
+![the shield running on a real KITTI drive](docs/drive_scene.gif)
+
+<sub>Drive 0009. Left: the recorded camera. Right: the lidar BEV the planner actually
+consumes, with the shield's permitted speed against what the human drove. Regenerate with
+`python3 scripts/animate_drive.py --drive 0009 --start 40 --stop 200`; the GIF is that mp4
+downsampled for inline playback (`docs/drive_scene.mp4` is the full 16 s at full res).</sub>
+
+**The result, in one line: across every configuration tested, the shield admitted zero
+collisions.**
+
+- **0 collisions** in every shielded run — behind a gap-following heuristic that crashes 68
+  times unaided, a PPO policy that crashes 42 times unaided, and uniformly random actions.
+  It does not depend on the policy being any good, which is the point of a runtime shield.
+- **It transfers.** Held on a second drive (0093) that nothing was tuned or trained on, and
+  on accumulated maps with 44% more occupied cells than the single scan it was measured on.
+  The certificate re-derives from whatever occupancy it is handed.
+- **What it costs:** success rate falls 78% → 75% with the shield bolted on. That is
+  conservatism against real geometry, and it is reported here rather than omitted.
+- **A soundness bug it had, found by a randomised rollout test** — the certificate was
+  issued under the current wheel angle while steering passed through unfiltered. Kept as a
+  regression test, written up below.
+
+Runs entirely on a laptop — pure NumPy + OpenCV, no GPU, no simulator install. **204 tests
+pass.**
 
 > **Why occupancy and not Gaussian splats?** Production AV stacks make live driving decisions
 > on lidar/occupancy/BEV grids, not photorealistic reconstructions. Splatting's real role in
@@ -14,6 +37,9 @@ Runs entirely on a laptop — pure NumPy + OpenCV, no GPU, no simulator install.
 > closed-loop test environments (see [Closed-loop in CARLA](#closed-loop-in-carla--nurec-scaffold)).
 
 ## Status
+
+<details>
+<summary><b>Component-by-component state and headline number for each (click to expand)</b></summary>
 
 | Piece | State |
 | --- | --- |
@@ -36,9 +62,11 @@ Runs entirely on a laptop — pure NumPy + OpenCV, no GPU, no simulator install.
 | Cross-drive validation on a second drive (0093) | done — **shield holds 0 collisions on a drive nothing was tuned on; dynamic shield reproduces; training doesn't generalise cross-drive (59% ≈ 58%); caught a fusion spawn-safety limitation** |
 | Closed-loop CARLA + NuRec bridge | scaffold — **runs the BEV + shield as a CARLA ego controller; handedness + "brakes for a wall dead ahead" tests green; policy hook stubbed, paused here** |
 
-**204 tests pass.** Dataset-backed tests skip cleanly when KITTI isn't downloaded; the
-environment core is pure NumPy and tests without any RL stack installed. The CARLA bridge's
-pure parts test with no `carla` package and no GPU.
+</details>
+
+Dataset-backed tests skip cleanly when KITTI isn't downloaded; the environment core is pure
+NumPy and tests without any RL stack installed. The CARLA bridge's pure parts test with no
+`carla` package and no GPU.
 
 ## Quickstart
 
@@ -526,10 +554,19 @@ repo's `safety_shield` as a driver plugin for
 [NVIDIA AlpaSim](https://github.com/NVlabs/alpasim), the open-source closed-loop AV validation
 harness released alongside NVIDIA's **Alpamayo** reasoning model — the question there is
 whether the shield still holds up in a harder, photorealistic environment it was never tuned
-on, eventually measured against AlpaSim's stock drivers. It's a scaffold, not yet functional:
-AlpaSim's driver interface is vision-only (camera frames in, trajectory waypoints out), which
-doesn't match the shield's per-step accel/steer + obstacle-field shape, and that gap is
-documented, not glossed over, in that repo's README.
+on, eventually measured against AlpaSim's stock drivers. Still a scaffold: the plugin is
+registered and verified against AlpaSim's real driver interface, but it runs against an
+empty obstacle field, so the shield has nothing to intervene on yet.
+
+The gap is documented rather than glossed over in that repo's README, and it is a real one.
+AlpaSim's drivers are vision-first — camera frames in, 6-DoF waypoint poses out — while this
+shield wants a per-step `(accel, steer)` and an `ObstacleField`. Bridging that means
+synthesizing occupancy from camera pixels, and **that is where the guarantee gets
+interesting**: a braking certificate is only as sound as the geometry it is computed
+against, so putting a learned depth estimator underneath it converts "provably no
+collisions" into "no collisions if perception was right." Quantifying how much the
+certificate degrades when its obstacle field is learned rather than measured is the
+experiment worth running there.
 
 ## Layout
 
